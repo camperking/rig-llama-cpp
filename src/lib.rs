@@ -11,6 +11,27 @@
 //! - **Reasoning / thinking** — extended thinking output is forwarded when the model supports it.
 //! - **Configurable sampling** — top-p, top-k, min-p, temperature, presence and repetition penalties.
 //!
+//! # Feature flags
+//!
+//! This crate forwards backend feature flags to `llama-cpp-2`.
+//!
+//! - `vulkan` (default)
+//! - `cuda`
+//! - `metal`
+//! - `rocm`
+//! - `openmp`
+//!
+//! Examples:
+//!
+//! ```text
+//! cargo build
+//! cargo build --no-default-features --features cuda
+//! cargo build --no-default-features --features rocm
+//! ```
+//!
+//! Backend support depends on the corresponding `llama-cpp-2` feature and any required
+//! native toolchain or system libraries being available on the host machine.
+//!
 //! # Quick start
 //!
 //! ```rust,no_run

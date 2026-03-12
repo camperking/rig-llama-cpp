@@ -8,8 +8,34 @@ A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF
 - Completion and streaming support
 - Tool calling (for models with OpenAI-compatible chat templates)
 - Reasoning / thinking output
-- Vulkan GPU acceleration
+- Backend selection via Cargo feature flags
 - Configurable sampling parameters (top-p, top-k, min-p, temperature, penalties)
+
+## Feature Flags
+
+This crate forwards backend feature flags to `llama-cpp-2`.
+
+- `vulkan` (default)
+- `cuda`
+- `metal`
+- `rocm`
+- `openmp`
+
+Examples:
+
+```sh
+# Default build (Vulkan)
+cargo build
+
+# CUDA build
+cargo build --no-default-features --features cuda
+
+# ROCm build
+cargo build --no-default-features --features rocm
+```
+
+Backend support depends on the corresponding `llama-cpp-2` feature and any required
+native toolchain or system libraries being available on the host machine.
 
 ## Usage
 
@@ -48,6 +74,18 @@ MODEL_PATH=./model.gguf cargo run --example stream_chat
 ```
 
 `N_GPU_LAYERS=20` can be used to offload 20 layers to the GPU.
+
+## Use latest llama.cpp
+
+To use the latest version of llama.cpp, clone the repo and point to the path in `Cargo.toml`. Make sure to update the submodules as well.
+
+```sh
+git clone --recursive https://github.com/utilityai/llama-cpp-rs
+git submodule update --init --recursive
+```
+
+Then update the dependency in `Cargo.toml`:
+`llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2" }`
 
 ## License
 
