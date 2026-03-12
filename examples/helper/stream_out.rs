@@ -16,10 +16,9 @@ pub async fn stream_out<R>(
                 print!("{text}");
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
             }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta {
-                id: _,
-                reasoning,
-            })) => {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ReasoningDelta { id: _, reasoning },
+            )) => {
                 // let reasoning = display_text(reasoning);
                 print!("{reasoning}");
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();

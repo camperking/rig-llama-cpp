@@ -30,6 +30,9 @@ impl Tool for GetCurrentTime {
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         use chrono::Utc;
-        Ok(format!("Current time: {}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")))
+        Ok(format!(
+            "Current time: {}",
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        ))
     }
 }

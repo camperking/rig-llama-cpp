@@ -1,3 +1,47 @@
+//! # rig-llama-cpp
+//!
+//! A [Rig](https://docs.rs/rig-core) completion provider that runs GGUF models locally
+//! via [llama.cpp](https://github.com/ggml-org/llama.cpp), with optional Vulkan GPU acceleration.
+//!
+//! This crate implements Rig's [`CompletionModel`] trait so that any GGUF model can be used
+//! as a drop-in replacement for cloud-based providers. It supports:
+//!
+//! - **Completion and streaming** — both one-shot and token-by-token responses.
+//! - **Tool calling** — models with OpenAI-compatible chat templates can invoke tools.
+//! - **Reasoning / thinking** — extended thinking output is forwarded when the model supports it.
+//! - **Configurable sampling** — top-p, top-k, min-p, temperature, presence and repetition penalties.
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! use rig::client::CompletionClient;
+//! use rig::completion::Prompt;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), anyhow::Error> {
+//! let client = rig_llama_cpp::Client::from_gguf(
+//!     "path/to/model.gguf",
+//!     99,   // n_gpu_layers
+//!     8192, // n_ctx
+//!     0.95, // top_p
+//!     20,   // top_k
+//!     0.0,  // min_p
+//!     1.5,  // presence_penalty
+//!     1.0,  // repetition_penalty
+//! )?;
+//!
+//! let agent = client
+//!     .agent("local")
+//!     .preamble("You are a helpful assistant.")
+//!     .max_tokens(512)
+//!     .build();
+//!
+//! let response = agent.prompt("Hello!").await?;
+//! println!("{response}");
+//! # Ok(())
+//! # }
+//! ```
+
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::thread;
@@ -6,7 +50,9 @@ use rig::client::CompletionClient;
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
-use rig::message::{AssistantContent, Message, Reasoning, ToolCall, ToolChoice, ToolFunction, UserContent};
+use rig::message::{
+    AssistantContent, Message, Reasoning, ToolCall, ToolChoice, ToolFunction, UserContent,
+};
 use rig::one_or_many::OneOrMany;
 use rig::streaming::{
     RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse, ToolCallDeltaContent,
@@ -16,18 +62,24 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-// === Response types ===
-
+/// Raw completion response returned by the model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawResponse {
+    /// The full generated text.
     pub text: String,
 }
 
+/// A single chunk emitted during streaming inference.
+///
+/// The final chunk in a stream includes token usage counts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamChunk {
+    /// The text fragment for this chunk.
     pub text: String,
+    /// Number of prompt tokens (only set on the final chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
+    /// Number of completion tokens (only set on the final chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
 }
@@ -69,7 +121,6 @@ struct InferenceParams {
     repetition_penalty: f32,
 }
 
-
 struct InferenceResult {
     text: String,
     choice: OneOrMany<AssistantContent>,
@@ -90,8 +141,10 @@ struct PromptBuildResult {
     template_result: Option<llama_cpp_2::model::ChatTemplateResult>,
 }
 
-// === Client ===
-
+/// The llama.cpp completion client.
+///
+/// `Client` loads a GGUF model on a dedicated inference thread and exposes it
+/// through Rig's [`CompletionClient`] trait. Create one with [`Client::from_gguf`].
 pub struct Client {
     request_tx: mpsc::UnboundedSender<InferenceRequest>,
     sampling_params: SamplingParams,
@@ -107,6 +160,22 @@ struct SamplingParams {
 }
 
 impl Client {
+    /// Load a GGUF model and start the inference worker thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` — Path to a `.gguf` model file.
+    /// * `n_gpu_layers` — Number of layers to offload to the GPU (`u32::MAX` for all).
+    /// * `n_ctx` — Context window size in tokens.
+    /// * `top_p` — Nucleus sampling threshold.
+    /// * `top_k` — Top-k sampling parameter.
+    /// * `min_p` — Minimum probability threshold.
+    /// * `presence_penalty` — Penalty for token presence.
+    /// * `repetition_penalty` — Penalty for token repetition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend fails to initialize or the model cannot be loaded.
     pub fn from_gguf(
         model_path: impl Into<String>,
         n_gpu_layers: u32,
@@ -148,8 +217,9 @@ impl CompletionClient for Client {
     type CompletionModel = Model;
 }
 
-// === Model ===
-
+/// A handle to a loaded model that implements Rig's [`CompletionModel`] trait.
+///
+/// Obtained via [`CompletionClient::agent`] or [`CompletionClient::model`] on a [`Client`].
 #[derive(Clone)]
 pub struct Model {
     request_tx: mpsc::UnboundedSender<InferenceRequest>,
@@ -175,8 +245,7 @@ impl CompletionModel for Model {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        let prepared_request = prepare_request(&request)
-            .map_err(CompletionError::ProviderError)?;
+        let prepared_request = prepare_request(&request).map_err(CompletionError::ProviderError)?;
         let max_tokens = request.max_tokens.unwrap_or(512) as u32;
         let temperature = request.temperature.unwrap_or(0.7) as f32;
 
@@ -219,12 +288,8 @@ impl CompletionModel for Model {
     async fn stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<
-        StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
-        let prepared_request = prepare_request(&request)
-            .map_err(CompletionError::ProviderError)?;
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let prepared_request = prepare_request(&request).map_err(CompletionError::ProviderError)?;
         let max_tokens = request.max_tokens.unwrap_or(512) as u32;
         let temperature = request.temperature.unwrap_or(0.7) as f32;
 
@@ -316,7 +381,7 @@ fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, Strin
         Some(ToolChoice::None) => Some("none".to_string()),
         Some(ToolChoice::Required) => Some("required".to_string()),
         Some(ToolChoice::Specific { .. }) => {
-            return Err("Specific tool choice is not supported by local llama adapter".into())
+            return Err("Specific tool choice is not supported by local llama adapter".into());
         }
     };
 
@@ -458,10 +523,10 @@ fn inference_worker(
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceRequest>,
 ) {
-    use llama_cpp_2::llama_backend::LlamaBackend;
-    use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::LlamaModel as LlamaCppModel;
     use llama_cpp_2::list_llama_ggml_backend_devices;
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use llama_cpp_2::model::LlamaModel as LlamaCppModel;
+    use llama_cpp_2::model::params::LlamaModelParams;
 
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
@@ -487,9 +552,7 @@ fn inference_worker(
                     params
                 }
                 Err(e) => {
-                    let _ = init_tx.send(Err(format!(
-                        "Failed to configure Vulkan devices: {e}"
-                    )));
+                    let _ = init_tx.send(Err(format!("Failed to configure Vulkan devices: {e}")));
                     return;
                 }
             };
@@ -512,7 +575,10 @@ fn inference_worker(
 
     // Process inference requests
     while let Some(req) = rx.blocking_recv() {
-        let InferenceRequest { params, response_channel } = req;
+        let InferenceRequest {
+            params,
+            response_channel,
+        } = req;
         match response_channel {
             ResponseChannel::Completion(tx) => {
                 let result = run_inference(&backend, &model, n_ctx, &params, None);
@@ -522,13 +588,12 @@ fn inference_worker(
                 let result = run_inference(&backend, &model, n_ctx, &params, Some(&stream_tx));
                 match result {
                     Ok(result) => {
-                        let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
-                            StreamChunk {
+                        let _ =
+                            stream_tx.send(Ok(RawStreamingChoice::FinalResponse(StreamChunk {
                                 text: result.text,
                                 prompt_tokens: Some(result.prompt_tokens),
                                 completion_tokens: Some(result.completion_tokens),
-                            },
-                        )));
+                            })));
                     }
                     Err(e) => {
                         let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
@@ -554,8 +619,8 @@ fn run_inference(
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None));
+    let ctx_params =
+        LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None));
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| format!("Context creation failed: {e}"))?;
@@ -734,7 +799,7 @@ impl StreamDeltaState {
                     if let Some(name) = function.get("name").and_then(Value::as_str) {
                         if !name.is_empty() {
                             existing.name = name.to_string();
-                            
+
                             choices.push(RawStreamingChoice::ToolCallDelta {
                                 id: existing.id.clone(),
                                 internal_call_id: existing.internal_call_id.clone(),
@@ -756,9 +821,7 @@ impl StreamDeltaState {
                             {
                                 match serde_json::from_str(&combined) {
                                     Ok(parsed) => existing.arguments = parsed,
-                                    Err(_) => {
-                                        existing.arguments = Value::String(combined)
-                                    }
+                                    Err(_) => existing.arguments = Value::String(combined),
                                 }
                             } else {
                                 existing.arguments = Value::String(combined);
@@ -823,16 +886,17 @@ fn build_prompt(
         }
     }
 
-    let parsed_messages: Vec<(String, String)> = serde_json::from_str::<Vec<Value>>(&request.messages_json)
-        .map_err(|e| format!("Message deserialization failed: {e}"))?
-        .into_iter()
-        .filter_map(|msg| {
-            Some((
-                msg.get("role")?.as_str()?.to_string(),
-                message_content_as_text(&msg).to_string(),
-            ))
-        })
-        .collect();
+    let parsed_messages: Vec<(String, String)> =
+        serde_json::from_str::<Vec<Value>>(&request.messages_json)
+            .map_err(|e| format!("Message deserialization failed: {e}"))?
+            .into_iter()
+            .filter_map(|msg| {
+                Some((
+                    msg.get("role")?.as_str()?.to_string(),
+                    message_content_as_text(&msg).to_string(),
+                ))
+            })
+            .collect();
 
     let chat_msgs: Vec<LlamaChatMessage> = parsed_messages
         .iter()
@@ -968,8 +1032,9 @@ fn parse_tool_call(value: &Value) -> Result<ToolCall, String> {
         .ok_or_else(|| "Tool call function is missing name".to_string())?
         .to_string();
     let arguments = match function.get("arguments") {
-        Some(Value::String(arguments)) => serde_json::from_str(arguments)
-            .unwrap_or_else(|_| Value::String(arguments.clone())),
+        Some(Value::String(arguments)) => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.clone()))
+        }
         Some(other) => other.clone(),
         None => Value::Null,
     };

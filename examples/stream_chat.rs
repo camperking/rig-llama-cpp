@@ -12,8 +12,8 @@ mod stream_out;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let model_path = std::env::var("MODEL_PATH")
-        .expect("Set MODEL_PATH env var to your GGUF model file path");
+    let model_path =
+        std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your GGUF model file path");
 
     let n_gpu_layers = std::env::var("N_GPU_LAYERS")
         .ok()
@@ -21,16 +21,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .transpose()?
         .unwrap_or(u32::MAX);
 
-    let client = rig_llama_cpp::Client::from_gguf(
-        &model_path,
-        n_gpu_layers,
-        262144,
-        0.95,
-        20,
-        0.0,
-        1.5,
-        1.0,
-    )?;
+    let client =
+        rig_llama_cpp::Client::from_gguf(&model_path, n_gpu_layers, 8192, 0.95, 20, 0.0, 1.5, 1.0)?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
 
