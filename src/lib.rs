@@ -219,7 +219,7 @@ impl CompletionClient for Client {
 
 /// A handle to a loaded model that implements Rig's [`CompletionModel`] trait.
 ///
-/// Obtained via [`CompletionClient::agent`] or [`CompletionClient::model`] on a [`Client`].
+/// Obtained via [`CompletionClient::agent`] on a [`Client`].
 #[derive(Clone)]
 pub struct Model {
     request_tx: mpsc::UnboundedSender<InferenceRequest>,
