@@ -1,0 +1,17 @@
+[package]
+name = "rig-llama-cpp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-core = "0.32.0"
+#llama-cpp-2 = { version = "0.1.138", features = ["vulkan"] }
+llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2", features = ["vulkan"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+encoding_rs = "0.8"
+thiserror = "2.0.18"
+chrono = "0.4.44"
+tokio-stream = "0.1"
