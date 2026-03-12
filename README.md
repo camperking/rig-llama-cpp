@@ -16,18 +16,15 @@ A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF
 ```rust
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
+use rig_llama_cpp::{ Client, SamplingParams };
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let client = rig_llama_cpp::Client::from_gguf(
+    let client = Client::from_gguf(
         "path/to/model.gguf",
         99,   // n_gpu_layers (u32::MAX for all)
         8192, // n_ctx
-        0.95, // top_p
-        20,   // top_k
-        0.0,  // min_p
-        1.5,  // presence_penalty
-        1.0,  // repetition_penalty
+        SamplingParams::default(),
     )?;
 
     let agent = client

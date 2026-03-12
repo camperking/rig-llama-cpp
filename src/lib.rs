@@ -16,6 +16,7 @@
 //! ```rust,no_run
 //! use rig::client::CompletionClient;
 //! use rig::completion::Prompt;
+//! use rig_llama_cpp::SamplingParams;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), anyhow::Error> {
@@ -23,11 +24,7 @@
 //!     "path/to/model.gguf",
 //!     99,   // n_gpu_layers
 //!     8192, // n_ctx
-//!     0.95, // top_p
-//!     20,   // top_k
-//!     0.0,  // min_p
-//!     1.5,  // presence_penalty
-//!     1.0,  // repetition_penalty
+//!     SamplingParams::default(),
 //! )?;
 //!
 //! let agent = client
@@ -150,13 +147,42 @@ pub struct Client {
     sampling_params: SamplingParams,
 }
 
-#[derive(Clone, Copy)]
-struct SamplingParams {
-    top_p: f32,
-    top_k: i32,
-    min_p: f32,
-    presence_penalty: f32,
-    repetition_penalty: f32,
+/// Sampling parameters that control token generation.
+///
+/// Use `Default::default()` for reasonable starting values, then override
+/// individual fields as needed.
+///
+/// ```
+/// let params = rig_llama_cpp::SamplingParams {
+///     top_k: 40,
+///     presence_penalty: 1.5,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SamplingParams {
+    /// Nucleus sampling threshold (default: `0.95`).
+    pub top_p: f32,
+    /// Top-k sampling parameter (default: `40`).
+    pub top_k: i32,
+    /// Minimum probability threshold (default: `0.0`).
+    pub min_p: f32,
+    /// Penalty for token presence (default: `0.0`).
+    pub presence_penalty: f32,
+    /// Penalty for token repetition (default: `1.0`).
+    pub repetition_penalty: f32,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            top_p: 0.95,
+            top_k: 40,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+        }
+    }
 }
 
 impl Client {
@@ -167,11 +193,7 @@ impl Client {
     /// * `model_path` — Path to a `.gguf` model file.
     /// * `n_gpu_layers` — Number of layers to offload to the GPU (`u32::MAX` for all).
     /// * `n_ctx` — Context window size in tokens.
-    /// * `top_p` — Nucleus sampling threshold.
-    /// * `top_k` — Top-k sampling parameter.
-    /// * `min_p` — Minimum probability threshold.
-    /// * `presence_penalty` — Penalty for token presence.
-    /// * `repetition_penalty` — Penalty for token repetition.
+    /// * `sampling_params` — Sampling parameters for token generation.
     ///
     /// # Errors
     ///
@@ -180,22 +202,11 @@ impl Client {
         model_path: impl Into<String>,
         n_gpu_layers: u32,
         n_ctx: u32,
-        top_p: f32,
-        top_k: i32,
-        min_p: f32,
-        presence_penalty: f32,
-        repetition_penalty: f32,
+        sampling_params: SamplingParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceRequest>();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let sampling_params = SamplingParams {
-            top_p,
-            top_k,
-            min_p,
-            presence_penalty,
-            repetition_penalty,
-        };
 
         thread::spawn(move || {
             inference_worker(&model_path, n_gpu_layers, n_ctx, init_tx, &mut request_rx);
@@ -505,13 +516,13 @@ fn tool_call_json(tool_call: &ToolCall) -> Value {
 
 fn has_thinking_request(params: &Value) -> bool {
     // check actual value of reasoning/thinking param if present
-    if let Some(reasoning) = params.get("reasoning").or_else(|| params.get("thinking")) {
-        if let Some(enabled) = reasoning.as_bool() {
-            return enabled;
-        }
+    if let Some(reasoning) = params.get("reasoning").or_else(|| params.get("thinking"))
+        && let Some(enabled) = reasoning.as_bool()
+    {
+        return enabled;
     }
 
-    return false;
+    false
 }
 
 // === Inference worker (runs on dedicated thread) ===
@@ -709,12 +720,12 @@ fn run_inference(
 
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
-        if let Some(parser) = stream_parser.as_mut() {
-            if let Ok(deltas) = parser.update("", false) {
-                for delta_json in deltas {
-                    for choice in delta_state.parse_delta(&delta_json) {
-                        let _ = tx.send(Ok(choice));
-                    }
+        if let Some(parser) = stream_parser.as_mut()
+            && let Ok(deltas) = parser.update("", false)
+        {
+            for delta_json in deltas {
+                for choice in delta_state.parse_delta(&delta_json) {
+                    let _ = tx.send(Ok(choice));
                 }
             }
         }
@@ -762,19 +773,19 @@ impl StreamDeltaState {
             return choices;
         };
 
-        if let Some(content) = obj.get("content").and_then(Value::as_str) {
-            if !content.is_empty() {
-                choices.push(RawStreamingChoice::Message(content.to_string()));
-            }
+        if let Some(content) = obj.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            choices.push(RawStreamingChoice::Message(content.to_string()));
         }
 
-        if let Some(reasoning) = obj.get("reasoning_content").and_then(Value::as_str) {
-            if !reasoning.is_empty() {
-                choices.push(RawStreamingChoice::ReasoningDelta {
-                    id: None,
-                    reasoning: reasoning.to_string(),
-                });
-            }
+        if let Some(reasoning) = obj.get("reasoning_content").and_then(Value::as_str)
+            && !reasoning.is_empty()
+        {
+            choices.push(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: reasoning.to_string(),
+            });
         }
 
         if let Some(tool_calls) = obj.get("tool_calls").and_then(Value::as_array) {
@@ -789,50 +800,50 @@ impl StreamDeltaState {
                     .or_insert_with(RawStreamingToolCall::empty);
 
                 // First delta carries the provider-supplied id
-                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        existing.id = id.to_string();
-                    }
+                if let Some(id) = tc.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    existing.id = id.to_string();
                 }
 
                 if let Some(function) = tc.get("function").and_then(Value::as_object) {
-                    if let Some(name) = function.get("name").and_then(Value::as_str) {
-                        if !name.is_empty() {
-                            existing.name = name.to_string();
+                    if let Some(name) = function.get("name").and_then(Value::as_str)
+                        && !name.is_empty()
+                    {
+                        existing.name = name.to_string();
 
-                            choices.push(RawStreamingChoice::ToolCallDelta {
-                                id: existing.id.clone(),
-                                internal_call_id: existing.internal_call_id.clone(),
-                                content: ToolCallDeltaContent::Name(name.to_string()),
-                            });
-                        }
+                        choices.push(RawStreamingChoice::ToolCallDelta {
+                            id: existing.id.clone(),
+                            internal_call_id: existing.internal_call_id.clone(),
+                            content: ToolCallDeltaContent::Name(name.to_string()),
+                        });
                     }
-                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                        if !arguments.is_empty() {
-                            // Accumulate arguments like the OpenAI implementation
-                            let current_args = match &existing.arguments {
-                                Value::Null => String::new(),
-                                Value::String(s) => s.clone(),
-                                v => v.to_string(),
-                            };
-                            let combined = format!("{current_args}{arguments}");
-                            if combined.trim_start().starts_with('{')
-                                && combined.trim_end().ends_with('}')
-                            {
-                                match serde_json::from_str(&combined) {
-                                    Ok(parsed) => existing.arguments = parsed,
-                                    Err(_) => existing.arguments = Value::String(combined),
-                                }
-                            } else {
-                                existing.arguments = Value::String(combined);
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+                        && !arguments.is_empty()
+                    {
+                        // Accumulate arguments like the OpenAI implementation
+                        let current_args = match &existing.arguments {
+                            Value::Null => String::new(),
+                            Value::String(s) => s.clone(),
+                            v => v.to_string(),
+                        };
+                        let combined = format!("{current_args}{arguments}");
+                        if combined.trim_start().starts_with('{')
+                            && combined.trim_end().ends_with('}')
+                        {
+                            match serde_json::from_str(&combined) {
+                                Ok(parsed) => existing.arguments = parsed,
+                                Err(_) => existing.arguments = Value::String(combined),
                             }
-
-                            choices.push(RawStreamingChoice::ToolCallDelta {
-                                id: existing.id.clone(),
-                                internal_call_id: existing.internal_call_id.clone(),
-                                content: ToolCallDeltaContent::Delta(arguments.to_string()),
-                            });
+                        } else {
+                            existing.arguments = Value::String(combined);
                         }
+
+                        choices.push(RawStreamingChoice::ToolCallDelta {
+                            id: existing.id.clone(),
+                            internal_call_id: existing.internal_call_id.clone(),
+                            content: ToolCallDeltaContent::Delta(arguments.to_string()),
+                        });
                     }
                 }
             }
@@ -905,13 +916,13 @@ fn build_prompt(
         .map_err(|e| format!("Chat message creation failed: {e}"))?;
 
     // Try model's built-in chat template first
-    if let Ok(tmpl) = model.chat_template(None) {
-        if let Ok(prompt) = model.apply_chat_template(&tmpl, &chat_msgs, true) {
-            return Ok(PromptBuildResult {
-                prompt,
-                template_result: None,
-            });
-        }
+    if let Ok(tmpl) = model.chat_template(None)
+        && let Ok(prompt) = model.apply_chat_template(&tmpl, &chat_msgs, true)
+    {
+        return Ok(PromptBuildResult {
+            prompt,
+            template_result: None,
+        });
     }
 
     // Fallback to ChatML format

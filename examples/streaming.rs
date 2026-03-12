@@ -1,6 +1,7 @@
 use rig::client::CompletionClient;
 use rig::streaming::StreamingPrompt;
 use rig::tool::ToolDyn;
+use rig_llama_cpp::{Client, SamplingParams};
 use serde_json::json;
 
 #[path = "./helper/time.rs"]
@@ -20,8 +21,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .transpose()?
         .unwrap_or(u32::MAX);
 
-    let client =
-        rig_llama_cpp::Client::from_gguf(&model_path, n_gpu_layers, 8192, 0.95, 20, 0.0, 1.5, 1.0)?;
+    let client = Client::from_gguf(
+        &model_path,
+        n_gpu_layers,
+        8192,
+        SamplingParams::default(),
+    )?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
 
