@@ -134,6 +134,11 @@ enum ResponseChannel {
     Streaming(StreamSender),
 }
 
+enum InferenceCommand {
+    Request(InferenceRequest),
+    Shutdown,
+}
+
 struct InferenceRequest {
     params: InferenceParams,
     response_channel: ResponseChannel,
@@ -175,8 +180,9 @@ struct PromptBuildResult {
 /// `Client` loads a GGUF model on a dedicated inference thread and exposes it
 /// through Rig's [`CompletionClient`] trait. Create one with [`Client::from_gguf`].
 pub struct Client {
-    request_tx: mpsc::UnboundedSender<InferenceRequest>,
+    request_tx: mpsc::UnboundedSender<InferenceCommand>,
     sampling_params: SamplingParams,
+    worker_handle: Option<thread::JoinHandle<()>>,
 }
 
 /// Sampling parameters that control token generation.
@@ -237,10 +243,10 @@ impl Client {
         sampling_params: SamplingParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceRequest>();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-        thread::spawn(move || {
+        let worker_handle = thread::spawn(move || {
             inference_worker(&model_path, n_gpu_layers, n_ctx, init_tx, &mut request_rx);
         });
 
@@ -252,7 +258,18 @@ impl Client {
         Ok(Self {
             request_tx,
             sampling_params,
+            worker_handle: Some(worker_handle),
         })
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.request_tx.send(InferenceCommand::Shutdown);
+
+        if let Some(worker_handle) = self.worker_handle.take() {
+            let _ = worker_handle.join();
+        }
     }
 }
 
@@ -265,7 +282,7 @@ impl CompletionClient for Client {
 /// Obtained via [`CompletionClient::agent`] on a [`Client`].
 #[derive(Clone)]
 pub struct Model {
-    request_tx: mpsc::UnboundedSender<InferenceRequest>,
+    request_tx: mpsc::UnboundedSender<InferenceCommand>,
     sampling_params: SamplingParams,
     #[allow(dead_code)]
     model_id: String,
@@ -295,7 +312,7 @@ impl CompletionModel for Model {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.request_tx
-            .send(InferenceRequest {
+            .send(InferenceCommand::Request(InferenceRequest {
                 params: InferenceParams {
                     prepared_request,
                     max_tokens,
@@ -307,7 +324,7 @@ impl CompletionModel for Model {
                     repetition_penalty: self.sampling_params.repetition_penalty,
                 },
                 response_channel: ResponseChannel::Completion(response_tx),
-            })
+            }))
             .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
 
         let result = response_rx
@@ -339,7 +356,7 @@ impl CompletionModel for Model {
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
 
         self.request_tx
-            .send(InferenceRequest {
+            .send(InferenceCommand::Request(InferenceRequest {
                 params: InferenceParams {
                     prepared_request,
                     max_tokens,
@@ -351,7 +368,7 @@ impl CompletionModel for Model {
                     repetition_penalty: self.sampling_params.repetition_penalty,
                 },
                 response_channel: ResponseChannel::Streaming(stream_tx),
-            })
+            }))
             .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
 
         Ok(StreamingCompletionResponse::stream(Box::pin(
@@ -564,7 +581,7 @@ fn inference_worker(
     n_gpu_layers: u32,
     n_ctx: u32,
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
-    rx: &mut mpsc::UnboundedReceiver<InferenceRequest>,
+    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
     use llama_cpp_2::list_llama_ggml_backend_devices;
     use llama_cpp_2::llama_backend::LlamaBackend;
@@ -628,7 +645,12 @@ fn inference_worker(
     let _ = init_tx.send(Ok(()));
 
     // Process inference requests
-    while let Some(req) = rx.blocking_recv() {
+    while let Some(command) = rx.blocking_recv() {
+        let req = match command {
+            InferenceCommand::Request(req) => req,
+            InferenceCommand::Shutdown => break,
+        };
+
         let InferenceRequest {
             params,
             response_channel,

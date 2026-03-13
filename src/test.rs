@@ -45,6 +45,12 @@ fn default_model_path() -> PathBuf {
 		.unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Qwen3.5-2B-Q4_K_M.gguf"))
 }
 
+fn required_model_path(name: &str) -> anyhow::Result<PathBuf> {
+	let path = std::env::var(name)
+		.with_context(|| format!("missing required environment variable {name}"))?;
+	Ok(PathBuf::from(path))
+}
+
 fn env_parse_u32(name: &str, default: u32) -> u32 {
 	std::env::var(name)
 		.ok()
@@ -410,6 +416,36 @@ async fn qwen35_e2e_inference_streaming_completion() -> anyhow::Result<()> {
 	attempt_tool_call(&model, &mut summary).await?;
 
 	println!("{summary}");
+
+	Ok(())
+}
+
+#[test]
+#[ignore = "loads two real GGUF models sequentially to validate backend reinitialization"]
+fn sequential_real_model_reload() -> anyhow::Result<()> {
+	let first = required_model_path("RIG_MODEL_A")?;
+	let second = required_model_path("RIG_MODEL_B")?;
+	ensure!(first.is_file(), "first model file not found at {}", first.display());
+	ensure!(second.is_file(), "second model file not found at {}", second.display());
+
+	let n_gpu_layers = env_parse_u32("N_GPU_LAYERS", u32::MAX);
+	let n_ctx = env_parse_u32("N_CTX", 8192);
+
+	{
+		let _client = Client::from_gguf(
+			first.to_string_lossy().into_owned(),
+			n_gpu_layers,
+			n_ctx,
+			SamplingParams::default(),
+		)?;
+	}
+
+	let _client = Client::from_gguf(
+		second.to_string_lossy().into_owned(),
+		n_gpu_layers,
+		n_ctx,
+		SamplingParams::default(),
+	)?;
 
 	Ok(())
 }
