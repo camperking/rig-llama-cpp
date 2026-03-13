@@ -75,6 +75,9 @@ MODEL_PATH=./model.gguf cargo run --example stream_chat
 
 `N_GPU_LAYERS=20` can be used to offload 20 layers to the GPU.
 
+By default, llama.cpp backend logs are suppressed so streaming and test output stay readable.
+Set `RIG_LLAMA_CPP_LOGS=1` to re-enable raw backend logs when debugging model startup or decode issues.
+
 ## Use latest llama.cpp
 
 To use the latest version of llama.cpp, clone the repo and point to the path in `Cargo.toml`. Make sure to update the submodules as well.

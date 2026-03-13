@@ -118,6 +118,17 @@ impl GetTokenUsage for StreamChunk {
 
 type StreamSender = mpsc::UnboundedSender<Result<RawStreamingChoice<StreamChunk>, CompletionError>>;
 
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
+fn llama_logs_enabled() -> bool {
+    env_flag_enabled("RIG_LLAMA_CPP_LOGS")
+}
+
 enum ResponseChannel {
     Completion(oneshot::Sender<Result<InferenceResult, String>>),
     Streaming(StreamSender),
@@ -560,13 +571,18 @@ fn inference_worker(
     use llama_cpp_2::model::LlamaModel as LlamaCppModel;
     use llama_cpp_2::model::params::LlamaModelParams;
 
-    let backend = match LlamaBackend::init() {
+    let mut backend = match LlamaBackend::init() {
         Ok(b) => b,
         Err(e) => {
             let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
             return;
         }
     };
+    let logs_enabled = llama_logs_enabled();
+
+    if !logs_enabled {
+        backend.void_logs();
+    }
 
     let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
@@ -580,7 +596,9 @@ fn inference_worker(
         if !vulkan_devices.is_empty() {
             model_params = match model_params.with_devices(&vulkan_devices) {
                 Ok(params) => {
-                    eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
+                    if logs_enabled {
+                        eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
+                    }
                     params
                 }
                 Err(e) => {
@@ -591,7 +609,9 @@ fn inference_worker(
         }
     }
 
-    eprintln!("Loading model from {model_path}...");
+    if logs_enabled {
+        eprintln!("Loading model from {model_path}...");
+    }
 
     let model = match LlamaCppModel::load_from_file(&backend, model_path, &model_params) {
         Ok(m) => m,
@@ -600,7 +620,9 @@ fn inference_worker(
             return;
         }
     };
-    eprintln!("Model loaded.");
+    if logs_enabled {
+        eprintln!("Model loaded.");
+    }
 
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
@@ -662,15 +684,25 @@ fn run_inference(
         .map_err(|e| format!("Tokenization failed: {e}"))?;
     let prompt_tokens = tokens.len() as u64;
 
-    let mut batch = LlamaBatch::new(n_ctx as usize, 1);
-    let last_index = tokens.len() as i32 - 1;
-    for (i, token) in (0_i32..).zip(tokens.into_iter()) {
-        batch
-            .add(token, i, &[0], i == last_index)
-            .map_err(|e| format!("Batch add failed: {e}"))?;
+    let prompt_len = tokens.len();
+    let prompt_batch_limit = ctx.n_batch().max(1) as usize;
+    let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
+
+    for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
+        batch.clear();
+
+        for (offset, token) in chunk.iter().copied().enumerate() {
+            let position = (chunk_index * prompt_batch_limit + offset) as i32;
+            let is_last_prompt_token = chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
+
+            batch
+                .add(token, position, &[0], is_last_prompt_token)
+                .map_err(|e| format!("Batch add failed: {e}"))?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| format!("Prompt decode failed: {e}"))?;
     }
-    ctx.decode(&mut batch)
-        .map_err(|e| format!("Prompt decode failed: {e}"))?;
 
     let mut sampler = LlamaSampler::chain_simple([
         LlamaSampler::top_k(req.top_k),
@@ -683,7 +715,7 @@ fn run_inference(
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = batch.n_tokens();
+    let mut n_cur = prompt_len as i32;
     let mut completion_tokens = 0u64;
 
     // Initialize streaming parser if streaming and we have a template result
@@ -1073,3 +1105,6 @@ fn parse_tool_call(value: &Value) -> Result<ToolCall, String> {
 
     Ok(ToolCall::new(id, ToolFunction::new(name, arguments)))
 }
+
+#[cfg(test)]
+mod test;
