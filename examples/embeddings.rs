@@ -49,9 +49,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let sim_12 = cosine_similarity(&embeddings[1].vec, &embeddings[2].vec);
 
     println!("\nCosine similarities:");
-    println!("  '{}' vs '{}': {sim_01:.4}", embeddings[0].document, embeddings[1].document);
-    println!("  '{}' vs '{}': {sim_02:.4}", embeddings[0].document, embeddings[2].document);
-    println!("  '{}' vs '{}': {sim_12:.4}", embeddings[1].document, embeddings[2].document);
+    println!(
+        "  '{}' vs '{}': {sim_01:.4}",
+        embeddings[0].document, embeddings[1].document
+    );
+    println!(
+        "  '{}' vs '{}': {sim_02:.4}",
+        embeddings[0].document, embeddings[2].document
+    );
+    println!(
+        "  '{}' vs '{}': {sim_12:.4}",
+        embeddings[1].document, embeddings[2].document
+    );
 
     Ok(())
 }

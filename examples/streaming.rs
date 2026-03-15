@@ -21,12 +21,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .transpose()?
         .unwrap_or(u32::MAX);
 
-    let client = Client::from_gguf(
-        &model_path,
-        n_gpu_layers,
-        8192,
-        SamplingParams::default(),
-    )?;
+    let client = Client::from_gguf(&model_path, n_gpu_layers, 8192, SamplingParams::default())?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
 
