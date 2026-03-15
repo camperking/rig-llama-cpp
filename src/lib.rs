@@ -122,7 +122,10 @@ type StreamSender = mpsc::UnboundedSender<Result<RawStreamingChoice<StreamChunk>
 
 fn env_flag_enabled(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => false,
     }
 }
@@ -754,6 +757,13 @@ fn run_inference(
     let mut delta_state = StreamDeltaState::new();
 
     for _ in 0..req.max_tokens {
+        // Stop early if the consumer disconnected (e.g. user cancelled).
+        if let Some(tx) = stream_tx
+            && tx.is_closed()
+        {
+            break;
+        }
+
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
@@ -1335,9 +1345,7 @@ fn embedding_worker(
                     params
                 }
                 Err(e) => {
-                    let _ = init_tx.send(Err(format!(
-                        "Failed to configure Vulkan devices: {e}"
-                    )));
+                    let _ = init_tx.send(Err(format!("Failed to configure Vulkan devices: {e}")));
                     return;
                 }
             };
