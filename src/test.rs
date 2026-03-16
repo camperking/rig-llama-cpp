@@ -530,3 +530,78 @@ async fn embedding_basic() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(feature = "mtmd")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a vision GGUF model, mmproj, and image file"]
+async fn vision_basic() -> anyhow::Result<()> {
+    use rig::message::{DocumentSourceKind, Image, ImageMediaType};
+
+    let model_path = required_model_path("MODEL_PATH")?;
+    let mmproj_path = required_model_path("MMPROJ_PATH")?;
+    let image_path = required_model_path("IMAGE_PATH")?;
+
+    ensure!(
+        model_path.is_file(),
+        "vision model not found at {}",
+        model_path.display()
+    );
+    ensure!(
+        mmproj_path.is_file(),
+        "mmproj file not found at {}",
+        mmproj_path.display()
+    );
+    ensure!(
+        image_path.is_file(),
+        "image file not found at {}",
+        image_path.display()
+    );
+
+    let n_gpu_layers = env_parse_u32("N_GPU_LAYERS", u32::MAX);
+    let n_ctx = env_parse_u32("N_CTX", 8192);
+
+    let image_bytes = std::fs::read(&image_path)
+        .with_context(|| format!("failed to read image at {}", image_path.display()))?;
+
+    let client = Client::from_gguf_with_mmproj(
+        model_path.to_string_lossy().into_owned(),
+        mmproj_path.to_string_lossy().into_owned(),
+        n_gpu_layers,
+        n_ctx,
+        SamplingParams::default(),
+    )?;
+    let model = client.completion_model("local");
+
+    let response = model
+        .completion_request("Describe this image briefly.")
+        .messages(vec![Message::from(OneOrMany::many(vec![
+            UserContent::Image(Image {
+                media_type: Some(ImageMediaType::PNG),
+                data: DocumentSourceKind::Raw(image_bytes),
+                detail: None,
+                additional_params: None,
+            }),
+            UserContent::text("What do you see in this image?"),
+        ])?)])
+        .max_tokens(256)
+        .temperature(0.3)
+        .send()
+        .await?;
+
+    ensure!(
+        !response.raw_response.text.trim().is_empty(),
+        "vision completion returned empty text"
+    );
+    ensure!(
+        response.usage.output_tokens > 0,
+        "vision completion returned zero output tokens"
+    );
+
+    println!(
+        "Vision test passed: output_tokens={}, text_preview={}",
+        response.usage.output_tokens,
+        &response.raw_response.text[..response.raw_response.text.len().min(100)]
+    );
+
+    Ok(())
+}

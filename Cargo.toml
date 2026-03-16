@@ -10,6 +10,7 @@ vulkan = ["llama-cpp-2/vulkan"]
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
 rocm = ["llama-cpp-2/rocm"]
+mtmd = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
 rig-core = "0.32.0"
@@ -22,3 +23,4 @@ encoding_rs = "0.8"
 thiserror = "2.0.18"
 chrono = "0.4.44"
 tokio-stream = "0.1"
+base64 = { version = "0.22", optional = true }

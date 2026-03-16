@@ -173,6 +173,8 @@ struct PreparedRequest {
     tool_choice: Option<String>,
     json_schema: Option<String>,
     enable_thinking: bool,
+    #[cfg(feature = "mtmd")]
+    images: Vec<Vec<u8>>,
 }
 
 struct PromptBuildResult {
@@ -252,7 +254,67 @@ impl Client {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         let worker_handle = thread::spawn(move || {
-            inference_worker(&model_path, n_gpu_layers, n_ctx, init_tx, &mut request_rx);
+            inference_worker(
+                &model_path,
+                None,
+                n_gpu_layers,
+                n_ctx,
+                init_tx,
+                &mut request_rx,
+            );
+        });
+
+        init_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Inference thread panicked during initialization"))?
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(Self {
+            request_tx,
+            sampling_params,
+            worker_handle: Some(worker_handle),
+        })
+    }
+
+    /// Load a GGUF vision model with a multimodal projector and start the inference worker thread.
+    ///
+    /// This constructor enables multimodal (vision) inference. The `mmproj_path` should point
+    /// to a GGUF multimodal projector file (mmproj) that corresponds to the vision model.
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` — Path to a `.gguf` vision model file.
+    /// * `mmproj_path` — Path to the corresponding multimodal projector `.gguf` file.
+    /// * `n_gpu_layers` — Number of layers to offload to the GPU (`u32::MAX` for all).
+    /// * `n_ctx` — Context window size in tokens.
+    /// * `sampling_params` — Sampling parameters for token generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend fails to initialize, the model cannot be loaded,
+    /// or the multimodal projector cannot be initialized.
+    #[cfg(feature = "mtmd")]
+    pub fn from_gguf_with_mmproj(
+        model_path: impl Into<String>,
+        mmproj_path: impl Into<String>,
+        n_gpu_layers: u32,
+        n_ctx: u32,
+        sampling_params: SamplingParams,
+    ) -> anyhow::Result<Self> {
+        let model_path = model_path.into();
+        let mmproj_path = mmproj_path.into();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+        let worker_handle = thread::spawn(move || {
+            inference_worker(
+                &model_path,
+                Some(&mmproj_path),
+                n_gpu_layers,
+                n_ctx,
+                init_tx,
+                &mut request_rx,
+            );
         });
 
         init_rx
@@ -457,6 +519,24 @@ fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, Strin
         .transpose()
         .map_err(|e| format!("Schema serialization failed: {e}"))?;
 
+    #[cfg(feature = "mtmd")]
+    let images = {
+        let mut imgs = Vec::new();
+        for msg in request.chat_history.iter() {
+            if let Message::User { content } = msg {
+                for item in content.iter() {
+                    if let UserContent::Image(image) = item {
+                        match extract_image_bytes(image) {
+                            Ok(bytes) => imgs.push(bytes),
+                            Err(e) => return Err(format!("Image extraction failed: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+        imgs
+    };
+
     Ok(PreparedRequest {
         messages_json: serde_json::to_string(&messages)
             .map_err(|e| format!("Message serialization failed: {e}"))?,
@@ -468,17 +548,29 @@ fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, Strin
             .as_ref()
             .map(has_thinking_request)
             .unwrap_or(false),
+        #[cfg(feature = "mtmd")]
+        images,
     })
 }
 
 fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
     match msg {
         Message::User { content } => {
-            let text = content
-                .iter()
-                .filter_map(user_content_text)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut parts = Vec::new();
+            for item in content.iter() {
+                match item {
+                    #[cfg(feature = "mtmd")]
+                    UserContent::Image(_) => {
+                        parts.push(llama_cpp_2::mtmd::mtmd_default_marker().to_string());
+                    }
+                    other => {
+                        if let Some(text) = user_content_text(other) {
+                            parts.push(text);
+                        }
+                    }
+                }
+            }
+            let text = parts.join("\n");
 
             if !text.is_empty() {
                 messages.push(json!({
@@ -568,6 +660,24 @@ fn tool_call_json(tool_call: &ToolCall) -> Value {
     })
 }
 
+#[cfg(feature = "mtmd")]
+fn extract_image_bytes(image: &rig::message::Image) -> Result<Vec<u8>, String> {
+    use rig::message::DocumentSourceKind;
+    match &image.data {
+        DocumentSourceKind::Raw(bytes) => Ok(bytes.clone()),
+        DocumentSourceKind::Base64(encoded) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| format!("Base64 decode failed: {e}"))
+        }
+        DocumentSourceKind::Url(_) => {
+            Err("URL image sources are not supported; pre-fetch the image data".into())
+        }
+        other => Err(format!("Unsupported image source kind: {other:?}")),
+    }
+}
+
 fn has_thinking_request(params: &Value) -> bool {
     // check actual value of reasoning/thinking param if present
     if let Some(reasoning) = params.get("reasoning").or_else(|| params.get("thinking"))
@@ -583,6 +693,7 @@ fn has_thinking_request(params: &Value) -> bool {
 
 fn inference_worker(
     model_path: &str,
+    mmproj_path: Option<&str>,
     n_gpu_layers: u32,
     n_ctx: u32,
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
@@ -646,6 +757,29 @@ fn inference_worker(
         eprintln!("Model loaded.");
     }
 
+    // Initialize multimodal context if mmproj_path is provided
+    #[cfg(feature = "mtmd")]
+    let mtmd_ctx = if let Some(mmproj) = mmproj_path {
+        let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
+        match llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params) {
+            Ok(ctx) => {
+                if logs_enabled {
+                    eprintln!("Multimodal projector loaded from {mmproj}.");
+                }
+                Some(ctx)
+            }
+            Err(e) => {
+                let _ = init_tx.send(Err(format!("Multimodal projector init failed: {e}")));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "mtmd"))]
+    let _ = mmproj_path;
+
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
@@ -660,13 +794,20 @@ fn inference_worker(
             params,
             response_channel,
         } = req;
+
+        #[cfg(feature = "mtmd")]
+        let mtmd_ref = mtmd_ctx.as_ref();
+        #[cfg(not(feature = "mtmd"))]
+        let mtmd_ref: Option<&()> = None;
+
         match response_channel {
             ResponseChannel::Completion(tx) => {
-                let result = run_inference(&backend, &model, n_ctx, &params, None);
+                let result = run_inference(&backend, &model, n_ctx, &params, None, mtmd_ref);
                 let _ = tx.send(result);
             }
             ResponseChannel::Streaming(stream_tx) => {
-                let result = run_inference(&backend, &model, n_ctx, &params, Some(&stream_tx));
+                let result =
+                    run_inference(&backend, &model, n_ctx, &params, Some(&stream_tx), mtmd_ref);
                 match result {
                     Ok(result) => {
                         let _ =
@@ -685,7 +826,32 @@ fn inference_worker(
     }
 }
 
+#[cfg(feature = "mtmd")]
 fn run_inference(
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model: &llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(backend, model, n_ctx, req, stream_tx, mtmd_ctx)
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference(
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model: &llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    _mtmd_ctx: Option<&()>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(backend, model, n_ctx, req, stream_tx)
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference_inner(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
@@ -695,7 +861,6 @@ fn run_inference(
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::AddBos;
-    use llama_cpp_2::sampling::LlamaSampler;
 
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
@@ -731,6 +896,144 @@ fn run_inference(
             .map_err(|e| format!("Prompt decode failed: {e}"))?;
     }
 
+    sample_tokens(
+        model,
+        &mut ctx,
+        &mut batch,
+        &prompt_build,
+        req,
+        stream_tx,
+        prompt_tokens,
+    )
+}
+
+#[cfg(feature = "mtmd")]
+fn run_inference_inner(
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model: &llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::model::AddBos;
+
+    let prompt_build = build_prompt(model, &req.prepared_request)?;
+    let prompt = prompt_build.prompt.as_str();
+
+    let ctx_params =
+        LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None));
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| format!("Context creation failed: {e}"))?;
+
+    let has_images = !req.prepared_request.images.is_empty();
+
+    if has_images && mtmd_ctx.is_some() {
+        let mtmd = mtmd_ctx.unwrap();
+
+        // Create bitmaps from raw image bytes
+        let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
+            .prepared_request
+            .images
+            .iter()
+            .map(|bytes| {
+                llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, bytes)
+                    .map_err(|e| format!("Failed to create bitmap from image data: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let bitmap_refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
+
+        let text_input = llama_cpp_2::mtmd::MtmdInputText {
+            text: prompt.to_string(),
+            add_special: true,
+            parse_special: true,
+        };
+
+        let chunks = mtmd
+            .tokenize(text_input, &bitmap_refs)
+            .map_err(|e| format!("Multimodal tokenization failed: {e}"))?;
+
+        let prompt_tokens = chunks.total_tokens() as u64;
+        let n_batch = ctx.n_batch() as i32;
+
+        let n_past = chunks
+            .eval_chunks(mtmd, &ctx, 0, 0, n_batch, true)
+            .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
+
+        // Set up batch for sampling — we need a batch positioned at n_past
+        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
+        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
+
+        // After eval_chunks, the context is ready for sampling.
+        // We need to set n_cur to n_past for the sampling loop.
+        // The batch from eval_chunks already set logits_last=true, so we can sample directly.
+        sample_tokens_from_pos(
+            model,
+            &mut ctx,
+            &mut batch,
+            &prompt_build,
+            req,
+            stream_tx,
+            prompt_tokens,
+            n_past as i32,
+        )
+    } else {
+        // Standard text-only path
+        let tokens = model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| format!("Tokenization failed: {e}"))?;
+        let prompt_tokens = tokens.len() as u64;
+
+        let prompt_len = tokens.len();
+        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
+        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
+
+        for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
+            batch.clear();
+
+            for (offset, token) in chunk.iter().copied().enumerate() {
+                let position = (chunk_index * prompt_batch_limit + offset) as i32;
+                let is_last_prompt_token =
+                    chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
+
+                batch
+                    .add(token, position, &[0], is_last_prompt_token)
+                    .map_err(|e| format!("Batch add failed: {e}"))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| format!("Prompt decode failed: {e}"))?;
+        }
+
+        sample_tokens(
+            model,
+            &mut ctx,
+            &mut batch,
+            &prompt_build,
+            req,
+            stream_tx,
+            prompt_tokens,
+        )
+    }
+}
+
+#[cfg(feature = "mtmd")]
+fn sample_tokens_from_pos(
+    model: &llama_cpp_2::model::LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
+    prompt_build: &PromptBuildResult,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    prompt_tokens: u64,
+    n_past: i32,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::sampling::LlamaSampler;
+
     let mut sampler = LlamaSampler::chain_simple([
         LlamaSampler::top_k(req.top_k),
         LlamaSampler::top_p(req.top_p, 1),
@@ -742,7 +1045,126 @@ fn run_inference(
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = prompt_len as i32;
+    let mut n_cur = n_past;
+    let mut completion_tokens = 0u64;
+
+    let mut stream_parser = if stream_tx.is_some() {
+        prompt_build
+            .template_result
+            .as_ref()
+            .and_then(|tr| tr.streaming_state_oaicompat().ok())
+    } else {
+        None
+    };
+    let mut delta_state = StreamDeltaState::new();
+
+    for _ in 0..req.max_tokens {
+        if let Some(tx) = stream_tx
+            && tx.is_closed()
+        {
+            break;
+        }
+
+        // For the first token after eval_chunks, sample from index -1 (last logits)
+        let sample_idx = if completion_tokens == 0 {
+            -1
+        } else {
+            batch.n_tokens() - 1
+        };
+        let token = sampler.sample(ctx, sample_idx);
+        sampler.accept(token);
+
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let piece = model
+            .token_to_piece(token, &mut decoder, false, None)
+            .map_err(|e| format!("Token to piece failed: {e}"))?;
+        output.push_str(&piece);
+        completion_tokens += 1;
+
+        if let Some(tx) = stream_tx {
+            if let Some(parser) = stream_parser.as_mut() {
+                match parser.update(&piece, true) {
+                    Ok(deltas) => {
+                        for delta_json in deltas {
+                            for choice in delta_state.parse_delta(&delta_json) {
+                                let _ = tx.send(Ok(choice));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let _ = tx.send(Ok(RawStreamingChoice::Message(piece.clone())));
+                    }
+                }
+            } else {
+                let _ = tx.send(Ok(RawStreamingChoice::Message(piece.clone())));
+            }
+        }
+
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|e| format!("Batch add failed: {e}"))?;
+        ctx.decode(batch)
+            .map_err(|e| format!("Decode failed: {e}"))?;
+        n_cur += 1;
+    }
+
+    // Flush remaining deltas from the streaming parser
+    if let Some(tx) = stream_tx {
+        if let Some(parser) = stream_parser.as_mut()
+            && let Ok(deltas) = parser.update("", false)
+        {
+            for delta_json in deltas {
+                for choice in delta_state.parse_delta(&delta_json) {
+                    let _ = tx.send(Ok(choice));
+                }
+            }
+        }
+        for choice in delta_state.flush_tool_calls() {
+            let _ = tx.send(Ok(choice));
+        }
+    }
+
+    let choice = if stream_tx.is_some() {
+        OneOrMany::one(AssistantContent::text(output.clone()))
+    } else {
+        parse_completion_output(&output, prompt_build.template_result.as_ref())?
+    };
+
+    Ok(InferenceResult {
+        text: output,
+        choice,
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn sample_tokens(
+    model: &llama_cpp_2::model::LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
+    prompt_build: &PromptBuildResult,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    prompt_tokens: u64,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::sampling::LlamaSampler;
+
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::top_k(req.top_k),
+        LlamaSampler::top_p(req.top_p, 1),
+        LlamaSampler::min_p(req.min_p, 1),
+        LlamaSampler::temp(req.temperature),
+        LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
+        LlamaSampler::dist(42),
+    ]);
+
+    let mut output = String::new();
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut n_cur = prompt_tokens as i32;
     let mut completion_tokens = 0u64;
 
     // Initialize streaming parser if streaming and we have a template result
@@ -764,7 +1186,7 @@ fn run_inference(
             break;
         }
 
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
         if model.is_eog_token(token) {
@@ -800,7 +1222,7 @@ fn run_inference(
         batch
             .add(token, n_cur, &[0], true)
             .map_err(|e| format!("Batch add failed: {e}"))?;
-        ctx.decode(&mut batch)
+        ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
         n_cur += 1;
     }
