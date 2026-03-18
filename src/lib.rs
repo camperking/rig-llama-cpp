@@ -141,7 +141,16 @@ enum ResponseChannel {
 
 enum InferenceCommand {
     Request(InferenceRequest),
+    Reload(ReloadRequest),
     Shutdown,
+}
+
+struct ReloadRequest {
+    model_path: String,
+    mmproj_path: Option<String>,
+    n_gpu_layers: u32,
+    n_ctx: u32,
+    result_tx: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
 struct InferenceRequest {
@@ -188,7 +197,7 @@ struct PromptBuildResult {
 /// through Rig's [`CompletionClient`] trait. Create one with [`Client::from_gguf`].
 pub struct Client {
     request_tx: mpsc::UnboundedSender<InferenceCommand>,
-    sampling_params: SamplingParams,
+    sampling_params: std::sync::RwLock<SamplingParams>,
     worker_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -271,7 +280,7 @@ impl Client {
 
         Ok(Self {
             request_tx,
-            sampling_params,
+            sampling_params: std::sync::RwLock::new(sampling_params),
             worker_handle: Some(worker_handle),
         })
     }
@@ -324,9 +333,41 @@ impl Client {
 
         Ok(Self {
             request_tx,
-            sampling_params,
+            sampling_params: std::sync::RwLock::new(sampling_params),
             worker_handle: Some(worker_handle),
         })
+    }
+
+    /// Reload the worker thread with a new model without destroying the backend.
+    ///
+    /// This swaps the model in-place on the existing inference thread, avoiding the
+    /// `LlamaBackend` singleton re-initialization race that occurs when dropping and
+    /// recreating a `Client`.
+    pub fn reload(
+        &self,
+        model_path: String,
+        mmproj_path: Option<String>,
+        n_gpu_layers: u32,
+        n_ctx: u32,
+        sampling: SamplingParams,
+    ) -> Result<(), String> {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        self.request_tx
+            .send(InferenceCommand::Reload(ReloadRequest {
+                model_path,
+                mmproj_path,
+                n_gpu_layers,
+                n_ctx,
+                result_tx,
+            }))
+            .map_err(|_| "Worker thread not running".to_string())?;
+        let result = result_rx
+            .recv()
+            .map_err(|_| "Worker thread exited during reload".to_string())?;
+        if result.is_ok() {
+            *self.sampling_params.write().unwrap() = sampling;
+        }
+        result
     }
 }
 
@@ -363,7 +404,7 @@ impl CompletionModel for Model {
     fn make(client: &Client, model: impl Into<String>) -> Self {
         Self {
             request_tx: client.request_tx.clone(),
-            sampling_params: client.sampling_params,
+            sampling_params: *client.sampling_params.read().unwrap(),
             model_id: model.into(),
         }
     }
@@ -691,6 +732,82 @@ fn has_thinking_request(params: &Value) -> bool {
 
 // === Inference worker (runs on dedicated thread) ===
 
+/// Load a model (and optionally multimodal projector) on the worker thread.
+///
+/// Returns the loaded model, optional mtmd context, and the n_ctx value.
+/// On failure returns an error string.
+fn load_model_on_worker(
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    model_path: &str,
+    mmproj_path: Option<&str>,
+    n_gpu_layers: u32,
+    n_ctx: u32,
+    logs_enabled: bool,
+) -> Result<WorkerModel, String> {
+    use llama_cpp_2::list_llama_ggml_backend_devices;
+    use llama_cpp_2::model::LlamaModel as LlamaCppModel;
+    use llama_cpp_2::model::params::LlamaModelParams;
+
+    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+
+    if backend.supports_gpu_offload() {
+        let vulkan_devices: Vec<usize> = list_llama_ggml_backend_devices()
+            .into_iter()
+            .filter(|device| device.backend.eq_ignore_ascii_case("vulkan"))
+            .map(|device| device.index)
+            .collect();
+
+        if !vulkan_devices.is_empty() {
+            model_params = model_params
+                .with_devices(&vulkan_devices)
+                .map_err(|e| format!("Failed to configure Vulkan devices: {e}"))?;
+            if logs_enabled {
+                eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
+            }
+        }
+    }
+
+    if logs_enabled {
+        eprintln!("Loading model from {model_path}...");
+    }
+
+    let model = LlamaCppModel::load_from_file(backend, model_path, &model_params)
+        .map_err(|e| format!("Model load failed: {e}"))?;
+    if logs_enabled {
+        eprintln!("Model loaded.");
+    }
+
+    #[cfg(feature = "mtmd")]
+    let mtmd_ctx = if let Some(mmproj) = mmproj_path {
+        let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
+        let ctx = llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params)
+            .map_err(|e| format!("Multimodal projector init failed: {e}"))?;
+        if logs_enabled {
+            eprintln!("Multimodal projector loaded from {mmproj}.");
+        }
+        Some(ctx)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "mtmd"))]
+    let _ = mmproj_path;
+
+    Ok(WorkerModel {
+        model,
+        #[cfg(feature = "mtmd")]
+        mtmd_ctx,
+        n_ctx,
+    })
+}
+
+struct WorkerModel {
+    model: llama_cpp_2::model::LlamaModel,
+    #[cfg(feature = "mtmd")]
+    mtmd_ctx: Option<llama_cpp_2::mtmd::MtmdContext>,
+    n_ctx: u32,
+}
+
 fn inference_worker(
     model_path: &str,
     mmproj_path: Option<&str>,
@@ -699,10 +816,7 @@ fn inference_worker(
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
-    use llama_cpp_2::list_llama_ggml_backend_devices;
     use llama_cpp_2::llama_backend::LlamaBackend;
-    use llama_cpp_2::model::LlamaModel as LlamaCppModel;
-    use llama_cpp_2::model::params::LlamaModelParams;
 
     let mut backend = match LlamaBackend::init() {
         Ok(b) => b,
@@ -717,111 +831,94 @@ fn inference_worker(
         backend.void_logs();
     }
 
-    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-
-    if backend.supports_gpu_offload() {
-        let vulkan_devices: Vec<usize> = list_llama_ggml_backend_devices()
-            .into_iter()
-            .filter(|device| device.backend.eq_ignore_ascii_case("vulkan"))
-            .map(|device| device.index)
-            .collect();
-
-        if !vulkan_devices.is_empty() {
-            model_params = match model_params.with_devices(&vulkan_devices) {
-                Ok(params) => {
-                    if logs_enabled {
-                        eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
-                    }
-                    params
-                }
-                Err(e) => {
-                    let _ = init_tx.send(Err(format!("Failed to configure Vulkan devices: {e}")));
-                    return;
-                }
-            };
-        }
-    }
-
-    if logs_enabled {
-        eprintln!("Loading model from {model_path}...");
-    }
-
-    let model = match LlamaCppModel::load_from_file(&backend, model_path, &model_params) {
-        Ok(m) => m,
+    let mut wm = match load_model_on_worker(
+        &backend,
+        model_path,
+        mmproj_path,
+        n_gpu_layers,
+        n_ctx,
+        logs_enabled,
+    ) {
+        Ok(wm) => wm,
         Err(e) => {
-            let _ = init_tx.send(Err(format!("Model load failed: {e}")));
+            let _ = init_tx.send(Err(e));
             return;
         }
     };
-    if logs_enabled {
-        eprintln!("Model loaded.");
-    }
-
-    // Initialize multimodal context if mmproj_path is provided
-    #[cfg(feature = "mtmd")]
-    let mtmd_ctx = if let Some(mmproj) = mmproj_path {
-        let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
-        match llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params) {
-            Ok(ctx) => {
-                if logs_enabled {
-                    eprintln!("Multimodal projector loaded from {mmproj}.");
-                }
-                Some(ctx)
-            }
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("Multimodal projector init failed: {e}")));
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "mtmd"))]
-    let _ = mmproj_path;
 
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
     // Process inference requests
     while let Some(command) = rx.blocking_recv() {
-        let req = match command {
-            InferenceCommand::Request(req) => req,
-            InferenceCommand::Shutdown => break,
-        };
+        match command {
+            InferenceCommand::Request(req) => {
+                let InferenceRequest {
+                    params,
+                    response_channel,
+                } = req;
 
-        let InferenceRequest {
-            params,
-            response_channel,
-        } = req;
+                #[cfg(feature = "mtmd")]
+                let mtmd_ref = wm.mtmd_ctx.as_ref();
+                #[cfg(not(feature = "mtmd"))]
+                let mtmd_ref: Option<&()> = None;
 
-        #[cfg(feature = "mtmd")]
-        let mtmd_ref = mtmd_ctx.as_ref();
-        #[cfg(not(feature = "mtmd"))]
-        let mtmd_ref: Option<&()> = None;
-
-        match response_channel {
-            ResponseChannel::Completion(tx) => {
-                let result = run_inference(&backend, &model, n_ctx, &params, None, mtmd_ref);
-                let _ = tx.send(result);
-            }
-            ResponseChannel::Streaming(stream_tx) => {
-                let result =
-                    run_inference(&backend, &model, n_ctx, &params, Some(&stream_tx), mtmd_ref);
-                match result {
-                    Ok(result) => {
-                        let _ =
-                            stream_tx.send(Ok(RawStreamingChoice::FinalResponse(StreamChunk {
-                                text: result.text,
-                                prompt_tokens: Some(result.prompt_tokens),
-                                completion_tokens: Some(result.completion_tokens),
-                            })));
+                match response_channel {
+                    ResponseChannel::Completion(tx) => {
+                        let result =
+                            run_inference(&backend, &wm.model, wm.n_ctx, &params, None, mtmd_ref);
+                        let _ = tx.send(result);
                     }
-                    Err(e) => {
-                        let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
+                    ResponseChannel::Streaming(stream_tx) => {
+                        let result = run_inference(
+                            &backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &params,
+                            Some(&stream_tx),
+                            mtmd_ref,
+                        );
+                        match result {
+                            Ok(result) => {
+                                let _ = stream_tx.send(Ok(
+                                    RawStreamingChoice::FinalResponse(StreamChunk {
+                                        text: result.text,
+                                        prompt_tokens: Some(result.prompt_tokens),
+                                        completion_tokens: Some(result.completion_tokens),
+                                    }),
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
+                            }
+                        }
                     }
                 }
             }
+            InferenceCommand::Reload(reload) => {
+                // Drop old model before loading the new one
+                drop(wm);
+
+                match load_model_on_worker(
+                    &backend,
+                    &reload.model_path,
+                    reload.mmproj_path.as_deref(),
+                    reload.n_gpu_layers,
+                    reload.n_ctx,
+                    logs_enabled,
+                ) {
+                    Ok(new_wm) => {
+                        wm = new_wm;
+                        let _ = reload.result_tx.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reload.result_tx.send(Err(e));
+                        // Can't continue without a model — exit the worker
+                        return;
+                    }
+                }
+            }
+            InferenceCommand::Shutdown => break,
         }
     }
 }
@@ -1736,11 +1833,21 @@ fn embedding_worker(
     use llama_cpp_2::model::LlamaModel as LlamaCppModel;
     use llama_cpp_2::model::params::LlamaModelParams;
 
-    let mut backend = match LlamaBackend::init() {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
-            return;
+    let mut backend = {
+        let mut attempts = 0;
+        loop {
+            match LlamaBackend::init() {
+                Ok(b) => break b,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
+                        return;
+                    }
+                    // Previous backend is being torn down — wait briefly
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
         }
     };
     let logs_enabled = llama_logs_enabled();
