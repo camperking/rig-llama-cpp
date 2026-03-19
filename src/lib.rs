@@ -1220,7 +1220,7 @@ fn sample_tokens_from_pos(
                 }
             }
         }
-        for choice in delta_state.flush_tool_calls() {
+        for choice in delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref()) {
             let _ = tx.send(Ok(choice));
         }
     }
@@ -1336,7 +1336,7 @@ fn sample_tokens(
             }
         }
         // Emit complete tool calls so they get accumulated into assistant_items
-        for choice in delta_state.flush_tool_calls() {
+        for choice in delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref()) {
             let _ = tx.send(Ok(choice));
         }
     }
@@ -1459,12 +1459,158 @@ impl StreamDeltaState {
     }
 
     /// Flush all accumulated tool calls as complete RawStreamingChoice::ToolCall events.
-    fn flush_tool_calls(&mut self) -> Vec<RawStreamingChoice<StreamChunk>> {
-        self.tool_calls
+    ///
+    /// If any tool call has incomplete arguments (a `Value::String` that doesn't parse
+    /// as a JSON object), we re-parse from the complete `output` using the chat template's
+    /// `parse_response_oaicompat`, which reliably extracts tool calls from the full text.
+    fn flush_tool_calls(
+        &mut self,
+        output: &str,
+        template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+    ) -> Vec<RawStreamingChoice<StreamChunk>> {
+        let mut tool_calls: Vec<(u64, RawStreamingToolCall)> = self
+            .tool_calls
             .drain()
             .filter(|(_, tc)| !tc.name.is_empty())
+            .collect();
+
+        // Check if any tool call has broken arguments
+        let has_broken = tool_calls.iter().any(|(_, tc)| !is_valid_json_args(&tc.arguments));
+
+        if has_broken {
+            if let Some(reparsed) = reparse_tool_calls_from_output(output, template_result) {
+                for (_, tc) in &mut tool_calls {
+                    if !is_valid_json_args(&tc.arguments) {
+                        // Find a matching tool call by name in the reparsed set
+                        if let Some(fixed_args) = reparsed
+                            .iter()
+                            .find(|(name, _)| name == &tc.name)
+                            .map(|(_, args)| args.clone())
+                        {
+                            tc.arguments = fixed_args;
+                        }
+                    }
+                }
+            }
+        }
+
+        tool_calls
+            .into_iter()
             .map(|(_, tool_call)| RawStreamingChoice::ToolCall(tool_call))
             .collect()
+    }
+}
+
+/// Returns true if the arguments represent valid JSON (an object or a string that parses as one).
+fn is_valid_json_args(args: &Value) -> bool {
+    match args {
+        Value::Object(_) => true,
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .is_some_and(|v| v.is_object()),
+        Value::Null => true, // no-arg tool calls are fine
+        _ => false,
+    }
+}
+
+/// Re-parse tool calls from the complete output using the chat template parser.
+/// Falls back to manual XML parsing for models that emit `<tool_call>` XML format.
+/// Returns a list of (name, arguments) pairs on success.
+fn reparse_tool_calls_from_output(
+    output: &str,
+    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+) -> Option<Vec<(String, Value)>> {
+    // Try the oaicompat parser first
+    if let Some(tr) = template_result {
+        if let Ok(parsed_json) = tr.parse_response_oaicompat(output, false) {
+            if let Ok(value) = serde_json::from_str::<Value>(&parsed_json) {
+                if let Some(obj) = value.as_object() {
+                    if let Some(tool_calls) = obj.get("tool_calls").and_then(Value::as_array) {
+                        let mut result = Vec::new();
+                        for tc in tool_calls {
+                            if let Some(function) = tc.get("function").and_then(Value::as_object) {
+                                let name = function.get("name").and_then(Value::as_str)?.to_string();
+                                let arguments = match function.get("arguments") {
+                                    Some(Value::String(s)) => {
+                                        serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                                    }
+                                    Some(other) => other.clone(),
+                                    None => Value::Null,
+                                };
+                                result.push((name, arguments));
+                            }
+                        }
+                        if !result.is_empty() {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: parse XML tool call format used by some models (e.g. Qwen)
+    // Format: <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...
+    parse_xml_tool_calls(output)
+}
+
+/// Parse XML-style tool calls emitted by some models (e.g. Qwen).
+///
+/// Example format:
+/// ```text
+/// <tool_call>
+/// <function=write_file>
+/// <parameter=path>
+/// output.txt
+/// </parameter>
+/// <parameter=content>
+/// Hello from LLM
+/// </parameter>
+/// </function>
+/// </tool_call>
+/// ```
+fn parse_xml_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
+    let mut results = Vec::new();
+
+    for block in output.split("<tool_call>").skip(1) {
+        let block = block.split("</tool_call>").next().unwrap_or(block);
+
+        // Extract function name: <function=NAME>
+        let func_start = block.find("<function=")?;
+        let after_eq = &block[func_start + "<function=".len()..];
+        let func_name_end = after_eq.find('>')?;
+        let func_name = after_eq[..func_name_end].trim().to_string();
+
+        // Extract parameters: <parameter=KEY>\nVALUE\n</parameter>
+        let mut args = serde_json::Map::new();
+        let mut search_from = 0;
+        while let Some(param_start) = block[search_from..].find("<parameter=") {
+            let abs_start = search_from + param_start;
+            let after_param_eq = &block[abs_start + "<parameter=".len()..];
+            let Some(key_end) = after_param_eq.find('>') else {
+                break;
+            };
+            let key = after_param_eq[..key_end].trim();
+
+            let value_start = abs_start + "<parameter=".len() + key_end + 1;
+            let Some(param_end) = block[value_start..].find("</parameter>") else {
+                break;
+            };
+            let value = block[value_start..value_start + param_end].trim();
+
+            args.insert(key.to_string(), Value::String(value.to_string()));
+            search_from = value_start + param_end + "</parameter>".len();
+        }
+
+        if !func_name.is_empty() {
+            results.push((func_name, Value::Object(args)));
+        }
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
     }
 }
 
