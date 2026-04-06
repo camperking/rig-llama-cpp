@@ -2,7 +2,7 @@ use rig::client::CompletionClient;
 use rig::message::Message;
 use rig::streaming::StreamingChat;
 use rig::tool::ToolDyn;
-use rig_llama_cpp::{Client, SamplingParams};
+use rig_llama_cpp::{Client, FitParams, SamplingParams};
 use serde_json::json;
 
 #[path = "./helper/time.rs"]
@@ -16,13 +16,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let model_path =
         std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your GGUF model file path");
 
-    let n_gpu_layers = std::env::var("N_GPU_LAYERS")
-        .ok()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(u32::MAX);
-
-    let client = Client::from_gguf(&model_path, n_gpu_layers, 8192, SamplingParams::default())?;
+    let client = Client::from_gguf(&model_path, 8192, SamplingParams::default(), FitParams::default())?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
 

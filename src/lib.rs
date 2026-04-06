@@ -38,15 +38,15 @@
 //! ```rust,no_run
 //! use rig::client::CompletionClient;
 //! use rig::completion::Prompt;
-//! use rig_llama_cpp::SamplingParams;
+//! use rig_llama_cpp::{FitParams, SamplingParams};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), anyhow::Error> {
 //! let client = rig_llama_cpp::Client::from_gguf(
 //!     "path/to/model.gguf",
-//!     99,   // n_gpu_layers
 //!     8192, // n_ctx
 //!     SamplingParams::default(),
+//!     FitParams::default(),
 //! )?;
 //!
 //! let agent = client
@@ -149,9 +149,8 @@ enum InferenceCommand {
 struct ReloadRequest {
     model_path: String,
     mmproj_path: Option<String>,
-    n_gpu_layers: u32,
     n_ctx: u32,
-    fit_params: Option<FitParams>,
+    fit_params: FitParams,
     result_tx: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
@@ -264,23 +263,26 @@ impl Default for FitParams {
 }
 
 impl Client {
-    /// Load a GGUF model and start the inference worker thread.
+    /// Load a GGUF model with automatic GPU/CPU layer fitting and start the inference worker thread.
+    ///
+    /// llama.cpp will probe available device memory and determine the optimal layer
+    /// distribution automatically.
     ///
     /// # Arguments
     ///
     /// * `model_path` — Path to a `.gguf` model file.
-    /// * `n_gpu_layers` — Number of layers to offload to the GPU (`u32::MAX` for all).
-    /// * `n_ctx` — Context window size in tokens.
+    /// * `n_ctx` — Desired context window size in tokens.
     /// * `sampling_params` — Sampling parameters for token generation.
+    /// * `fit_params` — Configuration for the fitting algorithm.
     ///
     /// # Errors
     ///
     /// Returns an error if the backend fails to initialize or the model cannot be loaded.
     pub fn from_gguf(
         model_path: impl Into<String>,
-        n_gpu_layers: u32,
         n_ctx: u32,
         sampling_params: SamplingParams,
+        fit_params: FitParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
@@ -290,8 +292,8 @@ impl Client {
             inference_worker(
                 &model_path,
                 None,
-                n_gpu_layers,
                 n_ctx,
+                &fit_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -309,7 +311,7 @@ impl Client {
         })
     }
 
-    /// Load a GGUF vision model with a multimodal projector and start the inference worker thread.
+    /// Load a GGUF vision model with a multimodal projector and automatic GPU/CPU layer fitting.
     ///
     /// This constructor enables multimodal (vision) inference. The `mmproj_path` should point
     /// to a GGUF multimodal projector file (mmproj) that corresponds to the vision model.
@@ -318,9 +320,9 @@ impl Client {
     ///
     /// * `model_path` — Path to a `.gguf` vision model file.
     /// * `mmproj_path` — Path to the corresponding multimodal projector `.gguf` file.
-    /// * `n_gpu_layers` — Number of layers to offload to the GPU (`u32::MAX` for all).
-    /// * `n_ctx` — Context window size in tokens.
+    /// * `n_ctx` — Desired context window size in tokens.
     /// * `sampling_params` — Sampling parameters for token generation.
+    /// * `fit_params` — Configuration for the fitting algorithm.
     ///
     /// # Errors
     ///
@@ -330,9 +332,9 @@ impl Client {
     pub fn from_gguf_with_mmproj(
         model_path: impl Into<String>,
         mmproj_path: impl Into<String>,
-        n_gpu_layers: u32,
         n_ctx: u32,
         sampling_params: SamplingParams,
+        fit_params: FitParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let mmproj_path = mmproj_path.into();
@@ -343,8 +345,8 @@ impl Client {
             inference_worker(
                 &model_path,
                 Some(&mmproj_path),
-                n_gpu_layers,
                 n_ctx,
+                &fit_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -371,17 +373,15 @@ impl Client {
         &self,
         model_path: String,
         mmproj_path: Option<String>,
-        n_gpu_layers: u32,
         n_ctx: u32,
         sampling: SamplingParams,
-        fit_params: Option<FitParams>,
+        fit_params: FitParams,
     ) -> Result<(), String> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         self.request_tx
             .send(InferenceCommand::Reload(ReloadRequest {
                 model_path,
                 mmproj_path,
-                n_gpu_layers,
                 n_ctx,
                 fit_params,
                 result_tx,
@@ -394,89 +394,6 @@ impl Client {
             *self.sampling_params.write().unwrap() = sampling;
         }
         result
-    }
-
-    /// Load a GGUF model with automatic GPU/CPU layer fitting.
-    ///
-    /// Instead of specifying `n_gpu_layers` manually, llama.cpp will probe available
-    /// device memory and determine the optimal layer distribution automatically.
-    ///
-    /// # Arguments
-    ///
-    /// * `model_path` — Path to a `.gguf` model file.
-    /// * `n_ctx` — Desired context window size in tokens.
-    /// * `sampling_params` — Sampling parameters for token generation.
-    /// * `fit_params` — Configuration for the fitting algorithm.
-    pub fn from_gguf_with_fit(
-        model_path: impl Into<String>,
-        n_ctx: u32,
-        sampling_params: SamplingParams,
-        fit_params: FitParams,
-    ) -> anyhow::Result<Self> {
-        let model_path = model_path.into();
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-        let worker_handle = thread::spawn(move || {
-            inference_worker_fit(
-                &model_path,
-                None,
-                n_ctx,
-                &fit_params,
-                init_tx,
-                &mut request_rx,
-            );
-        });
-
-        init_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Inference thread panicked during initialization"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        Ok(Self {
-            request_tx,
-            sampling_params: std::sync::RwLock::new(sampling_params),
-            worker_handle: Some(worker_handle),
-        })
-    }
-
-    /// Load a GGUF vision model with automatic GPU/CPU layer fitting.
-    ///
-    /// Combines multimodal projector support with automatic layer fitting.
-    #[cfg(feature = "mtmd")]
-    pub fn from_gguf_with_mmproj_and_fit(
-        model_path: impl Into<String>,
-        mmproj_path: impl Into<String>,
-        n_ctx: u32,
-        sampling_params: SamplingParams,
-        fit_params: FitParams,
-    ) -> anyhow::Result<Self> {
-        let model_path = model_path.into();
-        let mmproj_path = mmproj_path.into();
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-        let worker_handle = thread::spawn(move || {
-            inference_worker_fit(
-                &model_path,
-                Some(&mmproj_path),
-                n_ctx,
-                &fit_params,
-                init_tx,
-                &mut request_rx,
-            );
-        });
-
-        init_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Inference thread panicked during initialization"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        Ok(Self {
-            request_tx,
-            sampling_params: std::sync::RwLock::new(sampling_params),
-            worker_handle: Some(worker_handle),
-        })
     }
 }
 
@@ -848,75 +765,6 @@ fn has_thinking_request(params: &Value) -> bool {
 
 // === Inference worker (runs on dedicated thread) ===
 
-/// Load a model (and optionally multimodal projector) on the worker thread.
-///
-/// Returns the loaded model, optional mtmd context, and the n_ctx value.
-/// On failure returns an error string.
-fn load_model_on_worker(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model_path: &str,
-    mmproj_path: Option<&str>,
-    n_gpu_layers: u32,
-    n_ctx: u32,
-    logs_enabled: bool,
-) -> Result<WorkerModel, String> {
-    use llama_cpp_2::list_llama_ggml_backend_devices;
-    use llama_cpp_2::model::LlamaModel as LlamaCppModel;
-    use llama_cpp_2::model::params::LlamaModelParams;
-
-    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-
-    if backend.supports_gpu_offload() {
-        let vulkan_devices: Vec<usize> = list_llama_ggml_backend_devices()
-            .into_iter()
-            .filter(|device| device.backend.eq_ignore_ascii_case("vulkan"))
-            .map(|device| device.index)
-            .collect();
-
-        if !vulkan_devices.is_empty() {
-            model_params = model_params
-                .with_devices(&vulkan_devices)
-                .map_err(|e| format!("Failed to configure Vulkan devices: {e}"))?;
-            if logs_enabled {
-                eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
-            }
-        }
-    }
-
-    if logs_enabled {
-        eprintln!("Loading model from {model_path}...");
-    }
-
-    let model = LlamaCppModel::load_from_file(backend, model_path, &model_params)
-        .map_err(|e| format!("Model load failed: {e}"))?;
-    if logs_enabled {
-        eprintln!("Model loaded.");
-    }
-
-    #[cfg(feature = "mtmd")]
-    let mtmd_ctx = if let Some(mmproj) = mmproj_path {
-        let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
-        let ctx = llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params)
-            .map_err(|e| format!("Multimodal projector init failed: {e}"))?;
-        if logs_enabled {
-            eprintln!("Multimodal projector loaded from {mmproj}.");
-        }
-        Some(ctx)
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "mtmd"))]
-    let _ = mmproj_path;
-
-    Ok(WorkerModel {
-        model,
-        #[cfg(feature = "mtmd")]
-        mtmd_ctx,
-        n_ctx,
-    })
-}
-
 struct WorkerModel {
     model: llama_cpp_2::model::LlamaModel,
     #[cfg(feature = "mtmd")]
@@ -1038,7 +886,7 @@ fn fit_and_load_model(
     })
 }
 
-fn inference_worker_fit(
+fn inference_worker(
     model_path: &str,
     mmproj_path: Option<&str>,
     n_ctx: u32,
@@ -1067,132 +915,6 @@ fn inference_worker_fit(
         mmproj_path,
         n_ctx,
         fit_params,
-        logs_enabled,
-    ) {
-        Ok(wm) => wm,
-        Err(e) => {
-            let _ = init_tx.send(Err(e));
-            return;
-        }
-    };
-
-    // Signal successful initialization
-    let _ = init_tx.send(Ok(()));
-
-    // Process inference requests (same loop as inference_worker)
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            InferenceCommand::Request(req) => {
-                let InferenceRequest {
-                    params,
-                    response_channel,
-                } = req;
-
-                #[cfg(feature = "mtmd")]
-                let mtmd_ref = wm.mtmd_ctx.as_ref();
-                #[cfg(not(feature = "mtmd"))]
-                let mtmd_ref: Option<&()> = None;
-
-                match response_channel {
-                    ResponseChannel::Completion(tx) => {
-                        let result =
-                            run_inference(&backend, &wm.model, wm.n_ctx, &params, None, mtmd_ref);
-                        let _ = tx.send(result);
-                    }
-                    ResponseChannel::Streaming(stream_tx) => {
-                        let result = run_inference(
-                            &backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &params,
-                            Some(&stream_tx),
-                            mtmd_ref,
-                        );
-                        match result {
-                            Ok(result) => {
-                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
-                                    StreamChunk {
-                                        text: result.text,
-                                        prompt_tokens: Some(result.prompt_tokens),
-                                        completion_tokens: Some(result.completion_tokens),
-                                    },
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
-                            }
-                        }
-                    }
-                }
-            }
-            InferenceCommand::Reload(reload) => {
-                drop(wm);
-
-                let result = if let Some(fit) = &reload.fit_params {
-                    fit_and_load_model(
-                        &backend,
-                        &reload.model_path,
-                        reload.mmproj_path.as_deref(),
-                        reload.n_ctx,
-                        fit,
-                        logs_enabled,
-                    )
-                } else {
-                    load_model_on_worker(
-                        &backend,
-                        &reload.model_path,
-                        reload.mmproj_path.as_deref(),
-                        reload.n_gpu_layers,
-                        reload.n_ctx,
-                        logs_enabled,
-                    )
-                };
-
-                match result {
-                    Ok(new_wm) => {
-                        wm = new_wm;
-                        let _ = reload.result_tx.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = reload.result_tx.send(Err(e));
-                        return;
-                    }
-                }
-            }
-            InferenceCommand::Shutdown => break,
-        }
-    }
-}
-
-fn inference_worker(
-    model_path: &str,
-    mmproj_path: Option<&str>,
-    n_gpu_layers: u32,
-    n_ctx: u32,
-    init_tx: std::sync::mpsc::Sender<Result<(), String>>,
-    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
-) {
-    use llama_cpp_2::llama_backend::LlamaBackend;
-
-    let mut backend = match LlamaBackend::init() {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
-            return;
-        }
-    };
-    let logs_enabled = llama_logs_enabled();
-
-    if !logs_enabled {
-        backend.void_logs();
-    }
-
-    let mut wm = match load_model_on_worker(
-        &backend,
-        model_path,
-        mmproj_path,
-        n_gpu_layers,
-        n_ctx,
         logs_enabled,
     ) {
         Ok(wm) => wm,
@@ -1252,28 +974,16 @@ fn inference_worker(
                 }
             }
             InferenceCommand::Reload(reload) => {
-                // Drop old model before loading the new one
                 drop(wm);
 
-                let result = if let Some(fit) = &reload.fit_params {
-                    fit_and_load_model(
-                        &backend,
-                        &reload.model_path,
-                        reload.mmproj_path.as_deref(),
-                        reload.n_ctx,
-                        fit,
-                        logs_enabled,
-                    )
-                } else {
-                    load_model_on_worker(
-                        &backend,
-                        &reload.model_path,
-                        reload.mmproj_path.as_deref(),
-                        reload.n_gpu_layers,
-                        reload.n_ctx,
-                        logs_enabled,
-                    )
-                };
+                let result = fit_and_load_model(
+                    &backend,
+                    &reload.model_path,
+                    reload.mmproj_path.as_deref(),
+                    reload.n_ctx,
+                    &reload.fit_params,
+                    logs_enabled,
+                );
 
                 match result {
                     Ok(new_wm) => {
@@ -1282,7 +992,6 @@ fn inference_worker(
                     }
                     Err(e) => {
                         let _ = reload.result_tx.send(Err(e));
-                        // Can't continue without a model — exit the worker
                         return;
                     }
                 }

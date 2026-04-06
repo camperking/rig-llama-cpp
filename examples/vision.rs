@@ -13,7 +13,7 @@ async fn main() -> Result<(), anyhow::Error> {
     use rig::client::CompletionClient;
     use rig::completion::CompletionModel;
     use rig::message::{DocumentSourceKind, Image, ImageMediaType, Message, UserContent};
-    use rig_llama_cpp::{Client, SamplingParams};
+    use rig_llama_cpp::{Client, FitParams, SamplingParams};
 
     let model_path =
         std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your vision GGUF model");
@@ -22,20 +22,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let image_path =
         std::env::var("IMAGE_PATH").expect("Set IMAGE_PATH env var to an image file path");
 
-    let n_gpu_layers = std::env::var("N_GPU_LAYERS")
-        .ok()
-        .map(|v| v.parse())
-        .transpose()?
-        .unwrap_or(u32::MAX);
-
     let image_bytes = std::fs::read(&image_path)?;
 
     let client = Client::from_gguf_with_mmproj(
         &model_path,
         &mmproj_path,
-        n_gpu_layers,
         8192,
         SamplingParams::default(),
+        FitParams::default(),
     )?;
 
     let model = client.completion_model("local");

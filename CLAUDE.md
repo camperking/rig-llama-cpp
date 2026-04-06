@@ -40,9 +40,6 @@ RIG_MODEL_A=./model_a.gguf RIG_MODEL_B=./model_b.gguf cargo test sequential -- -
 MODEL_PATH=./model.gguf cargo run --example completion
 MODEL_PATH=./model.gguf cargo run --example streaming
 MODEL_PATH=./model.gguf cargo run --example stream_chat
-
-# With GPU offloading
-N_GPU_LAYERS=20 MODEL_PATH=./model.gguf cargo run --example completion
 ```
 
 ## Environment Variables
@@ -50,7 +47,6 @@ N_GPU_LAYERS=20 MODEL_PATH=./model.gguf cargo run --example completion
 | Variable | Purpose |
 |---|---|
 | `MODEL_PATH` | Path to GGUF model file |
-| `N_GPU_LAYERS` | Layers to offload to GPU (default: all) |
 | `N_CTX` | Context window size |
 | `RIG_LLAMA_CPP_LOGS` | Enable llama.cpp backend logs (`1` or `true`) |
 | `RIG_MAX_TOKENS_PER_TURN` | Max tokens per generation turn |

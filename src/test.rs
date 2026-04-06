@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 
 use rig::embeddings::EmbeddingModel as _;
 
-use crate::{Client, EmbeddingClient, Model, SamplingParams};
+use crate::{Client, EmbeddingClient, FitParams, Model, SamplingParams};
 
 #[derive(Debug, Default)]
 struct RunSummary {
@@ -332,7 +332,6 @@ async fn qwen35_e2e_inference_streaming_completion() -> anyhow::Result<()> {
         model_path.display()
     );
 
-    let n_gpu_layers = env_parse_u32("N_GPU_LAYERS", u32::MAX);
     let n_ctx = env_parse_u32("N_CTX", 32_768);
     let max_tokens_per_turn = env_parse_u64("RIG_MAX_TOKENS_PER_TURN", 3_072);
     let target_output_tokens = env_parse_u64("RIG_TARGET_OUTPUT_TOKENS", 10_000);
@@ -341,9 +340,9 @@ async fn qwen35_e2e_inference_streaming_completion() -> anyhow::Result<()> {
 
     let client = Client::from_gguf(
         model_path.to_string_lossy().into_owned(),
-        n_gpu_layers,
         n_ctx,
         SamplingParams::default(),
+        FitParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -445,23 +444,22 @@ fn sequential_real_model_reload() -> anyhow::Result<()> {
         second.display()
     );
 
-    let n_gpu_layers = env_parse_u32("N_GPU_LAYERS", u32::MAX);
     let n_ctx = env_parse_u32("N_CTX", 8192);
 
     {
         let _client = Client::from_gguf(
             first.to_string_lossy().into_owned(),
-            n_gpu_layers,
             n_ctx,
             SamplingParams::default(),
+            FitParams::default(),
         )?;
     }
 
     let _client = Client::from_gguf(
         second.to_string_lossy().into_owned(),
-        n_gpu_layers,
         n_ctx,
         SamplingParams::default(),
+        FitParams::default(),
     )?;
 
     Ok(())
@@ -557,7 +555,6 @@ async fn vision_basic() -> anyhow::Result<()> {
         image_path.display()
     );
 
-    let n_gpu_layers = env_parse_u32("N_GPU_LAYERS", u32::MAX);
     let n_ctx = env_parse_u32("N_CTX", 8192);
 
     let image_bytes = std::fs::read(&image_path)
@@ -566,9 +563,9 @@ async fn vision_basic() -> anyhow::Result<()> {
     let client = Client::from_gguf_with_mmproj(
         model_path.to_string_lossy().into_owned(),
         mmproj_path.to_string_lossy().into_owned(),
-        n_gpu_layers,
         n_ctx,
         SamplingParams::default(),
+        FitParams::default(),
     )?;
     let model = client.completion_model("local");
 
