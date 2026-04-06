@@ -112,6 +112,7 @@ impl GetTokenUsage for StreamChunk {
             output_tokens: output,
             total_tokens: input + output,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 }
@@ -447,6 +448,7 @@ impl CompletionModel for Model {
                 output_tokens: result.completion_tokens,
                 total_tokens: result.prompt_tokens + result.completion_tokens,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             raw_response: RawResponse { text: result.text },
             message_id: None,
@@ -667,6 +669,12 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                     "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
                 }));
             }
+        }
+        Message::System { content } => {
+            messages.push(json!({
+                "role": "system",
+                "content": content,
+            }));
         }
     }
 }
