@@ -151,6 +151,7 @@ struct ReloadRequest {
     mmproj_path: Option<String>,
     n_gpu_layers: u32,
     n_ctx: u32,
+    fit_params: Option<FitParams>,
     result_tx: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
@@ -373,6 +374,7 @@ impl Client {
         n_gpu_layers: u32,
         n_ctx: u32,
         sampling: SamplingParams,
+        fit_params: Option<FitParams>,
     ) -> Result<(), String> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         self.request_tx
@@ -381,6 +383,7 @@ impl Client {
                 mmproj_path,
                 n_gpu_layers,
                 n_ctx,
+                fit_params,
                 result_tx,
             }))
             .map_err(|_| "Worker thread not running".to_string())?;
@@ -1125,14 +1128,27 @@ fn inference_worker_fit(
             InferenceCommand::Reload(reload) => {
                 drop(wm);
 
-                match load_model_on_worker(
-                    &backend,
-                    &reload.model_path,
-                    reload.mmproj_path.as_deref(),
-                    reload.n_gpu_layers,
-                    reload.n_ctx,
-                    logs_enabled,
-                ) {
+                let result = if let Some(fit) = &reload.fit_params {
+                    fit_and_load_model(
+                        &backend,
+                        &reload.model_path,
+                        reload.mmproj_path.as_deref(),
+                        reload.n_ctx,
+                        fit,
+                        logs_enabled,
+                    )
+                } else {
+                    load_model_on_worker(
+                        &backend,
+                        &reload.model_path,
+                        reload.mmproj_path.as_deref(),
+                        reload.n_gpu_layers,
+                        reload.n_ctx,
+                        logs_enabled,
+                    )
+                };
+
+                match result {
                     Ok(new_wm) => {
                         wm = new_wm;
                         let _ = reload.result_tx.send(Ok(()));
@@ -1239,14 +1255,27 @@ fn inference_worker(
                 // Drop old model before loading the new one
                 drop(wm);
 
-                match load_model_on_worker(
-                    &backend,
-                    &reload.model_path,
-                    reload.mmproj_path.as_deref(),
-                    reload.n_gpu_layers,
-                    reload.n_ctx,
-                    logs_enabled,
-                ) {
+                let result = if let Some(fit) = &reload.fit_params {
+                    fit_and_load_model(
+                        &backend,
+                        &reload.model_path,
+                        reload.mmproj_path.as_deref(),
+                        reload.n_ctx,
+                        fit,
+                        logs_enabled,
+                    )
+                } else {
+                    load_model_on_worker(
+                        &backend,
+                        &reload.model_path,
+                        reload.mmproj_path.as_deref(),
+                        reload.n_gpu_layers,
+                        reload.n_ctx,
+                        logs_enabled,
+                    )
+                };
+
+                match result {
                     Ok(new_wm) => {
                         wm = new_wm;
                         let _ = reload.result_tx.send(Ok(()));
