@@ -624,27 +624,73 @@ fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, Strin
 fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
     match msg {
         Message::User { content } => {
-            let mut parts = Vec::new();
-            for item in content.iter() {
-                match item {
-                    #[cfg(feature = "mtmd")]
-                    UserContent::Image(_) => {
-                        parts.push(llama_cpp_2::mtmd::mtmd_default_marker().to_string());
-                    }
-                    other => {
-                        if let Some(text) = user_content_text(other) {
-                            parts.push(text);
+            #[cfg(feature = "mtmd")]
+            let has_images = content
+                .iter()
+                .any(|item| matches!(item, UserContent::Image(_)));
+
+            #[cfg(feature = "mtmd")]
+            if has_images {
+                // Use structured content parts matching llama.cpp server behavior.
+                // This ensures templates that distinguish media_marker from text
+                // (e.g. Qwen3.5-VL) handle images correctly regardless of
+                // enable_thinking or reasoning_format settings.
+                let mut content_parts = Vec::new();
+                for item in content.iter() {
+                    match item {
+                        UserContent::Image(_) => {
+                            content_parts.push(json!({
+                                "type": "media_marker",
+                                "text": llama_cpp_2::mtmd::mtmd_default_marker()
+                            }));
+                        }
+                        other => {
+                            if let Some(text) = user_content_text(other) {
+                                content_parts.push(json!({
+                                    "type": "text",
+                                    "text": text
+                                }));
+                            }
                         }
                     }
                 }
+                if !content_parts.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                }
+            } else {
+                let mut parts = Vec::new();
+                for item in content.iter() {
+                    if let Some(text) = user_content_text(item) {
+                        parts.push(text);
+                    }
+                }
+                let text = parts.join("\n");
+                if !text.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text,
+                    }));
+                }
             }
-            let text = parts.join("\n");
 
-            if !text.is_empty() {
-                messages.push(json!({
-                    "role": "user",
-                    "content": text,
-                }));
+            #[cfg(not(feature = "mtmd"))]
+            {
+                let mut parts = Vec::new();
+                for item in content.iter() {
+                    if let Some(text) = user_content_text(item) {
+                        parts.push(text);
+                    }
+                }
+                let text = parts.join("\n");
+                if !text.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text,
+                    }));
+                }
             }
 
             let tool_results: Vec<_> = content
@@ -1959,7 +2005,11 @@ fn build_prompt(
             tool_choice: request.tool_choice.as_deref(),
             json_schema: request.json_schema.as_deref(),
             grammar: None,
-            reasoning_format: Some("auto"),
+            reasoning_format: if request.enable_thinking {
+                Some("auto")
+            } else {
+                Some("none")
+            },
             chat_template_kwargs: Some(&chat_template_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
@@ -1991,6 +2041,13 @@ fn build_prompt(
             Err(e) => {
                 if llama_logs_enabled() {
                     eprintln!("[rig-llama-cpp] apply_chat_template_oaicompat failed: {e}, falling back");
+                }
+                #[cfg(feature = "mtmd")]
+                if !request.images.is_empty() {
+                    return Err(format!(
+                        "Chat template failed for multimodal request: {e}. \
+                         The model's chat template may not support the current configuration."
+                    ));
                 }
             }
         }
