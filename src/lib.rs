@@ -61,7 +61,7 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::thread;
 
@@ -1238,6 +1238,48 @@ fn run_inference_inner(
     }
 }
 
+/// Build a set of token IDs that should be decoded with `special = true`.
+///
+/// Models like Gemma-4 use control tokens (`<|channel>`, `<channel|>`, etc.) for
+/// structured output (thinking, tool calls). These tokens are invisible when decoded
+/// with `special = false`, making the PEG parser unable to extract reasoning content.
+/// The template result's `preserved_tokens` lists the token strings that must remain
+/// visible — matching the approach used by llama.cpp's server.
+fn build_preserved_token_set(
+    model: &llama_cpp_2::model::LlamaModel,
+    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+) -> HashSet<llama_cpp_2::token::LlamaToken> {
+    use llama_cpp_2::model::AddBos;
+
+    let mut set = HashSet::new();
+    let Some(tr) = template_result else {
+        return set;
+    };
+    for token_str in &tr.preserved_tokens {
+        if let Ok(ids) = model.str_to_token(token_str, AddBos::Never) {
+            if ids.len() == 1 {
+                set.insert(ids[0]);
+            }
+        }
+    }
+    if llama_logs_enabled() && !set.is_empty() {
+        eprintln!(
+            "[rig-llama-cpp] preserved tokens: {:?}",
+            tr.preserved_tokens
+        );
+    }
+    set
+}
+
+/// Collect additional stop sequences from the template result.
+fn get_additional_stops(
+    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+) -> Vec<String> {
+    template_result
+        .map(|tr| tr.additional_stops.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(feature = "mtmd")]
 fn sample_tokens_from_pos(
     model: &llama_cpp_2::model::LlamaModel,
@@ -1259,6 +1301,9 @@ fn sample_tokens_from_pos(
         LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
         LlamaSampler::dist(42),
     ]);
+
+    let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
+    let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -1295,11 +1340,19 @@ fn sample_tokens_from_pos(
             break;
         }
 
+        let decode_special = preserved_tokens.contains(&token);
         let piece = model
-            .token_to_piece(token, &mut decoder, false, None)
+            .token_to_piece(token, &mut decoder, decode_special, None)
             .map_err(|e| format!("Token to piece failed: {e}"))?;
         output.push_str(&piece);
         completion_tokens += 1;
+
+        // Check for additional stop sequences
+        if let Some(stop) = additional_stops.iter().find(|s| output.ends_with(s.as_str())) {
+            let stop_len = stop.len();
+            output.truncate(output.len() - stop_len);
+            break;
+        }
 
         if let Some(tx) = stream_tx {
             if let Some(parser) = stream_parser.as_mut() {
@@ -1379,6 +1432,9 @@ fn sample_tokens(
         LlamaSampler::dist(42),
     ]);
 
+    let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
+    let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
+
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = prompt_tokens as i32;
@@ -1410,11 +1466,19 @@ fn sample_tokens(
             break;
         }
 
+        let decode_special = preserved_tokens.contains(&token);
         let piece = model
-            .token_to_piece(token, &mut decoder, false, None)
+            .token_to_piece(token, &mut decoder, decode_special, None)
             .map_err(|e| format!("Token to piece failed: {e}"))?;
         output.push_str(&piece);
         completion_tokens += 1;
+
+        // Check for additional stop sequences
+        if let Some(stop) = additional_stops.iter().find(|s| output.ends_with(s.as_str())) {
+            let stop_len = stop.len();
+            output.truncate(output.len() - stop_len);
+            break;
+        }
 
         if let Some(tx) = stream_tx {
             if let Some(parser) = stream_parser.as_mut() {
@@ -1838,9 +1902,15 @@ fn parse_completion_output(
     raw_text: &str,
     template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
 ) -> Result<OneOrMany<AssistantContent>, String> {
+    if llama_logs_enabled() {
+        eprintln!("[rig-llama-cpp] raw output:\n{raw_text}");
+    }
     if let Some(template_result) = template_result {
         match template_result.parse_response_oaicompat(raw_text, false) {
             Ok(parsed_json) => {
+                if llama_logs_enabled() {
+                    eprintln!("[rig-llama-cpp] parsed response: {parsed_json}");
+                }
                 if let Ok(choice) = parse_oaicompat_message(&parsed_json, raw_text) {
                     return Ok(choice);
                 }
