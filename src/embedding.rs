@@ -268,6 +268,7 @@ fn run_embedding(
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_n_seq_max((texts.len() as u32).max(1))
         .with_embeddings(true);
 
     let mut ctx = model
