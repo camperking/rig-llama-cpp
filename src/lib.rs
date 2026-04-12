@@ -840,7 +840,7 @@ fn fit_and_load_model(
             &mut cparams,
             &mut margins,
             fit.n_ctx_min,
-            log_level,
+            log_level as u32,
         )
         .map_err(|e| format!("Parameter fitting failed: {e}"))?;
 
