@@ -279,8 +279,22 @@ pub(crate) fn parse_completion_output(
                 }
             }
             Err(err) => {
-                eprintln!("Failed to parse llama response as OpenAI-compatible content: {err}");
+                eprintln!("Failed to parse llama response as OpenAI-compatible content: {err} (will try XML fallback)");
             }
+        }
+    }
+
+    // Fallback: try XML tool call format before returning raw text
+    if let Some(xml_tool_calls) = parse_xml_tool_calls(raw_text) {
+        let mut content: Vec<AssistantContent> = Vec::new();
+        for (i, (name, arguments)) in xml_tool_calls.into_iter().enumerate() {
+            content.push(AssistantContent::ToolCall(ToolCall::new(
+                format!("xml-tool-call-{i}"),
+                ToolFunction::new(name, arguments),
+            )));
+        }
+        if let Ok(result) = OneOrMany::many(content) {
+            return Ok(result);
         }
     }
 

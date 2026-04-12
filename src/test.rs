@@ -432,6 +432,20 @@ async fn e2e_inference_streaming_completion() -> anyhow::Result<()> {
 
     attempt_tool_call(&model, &mut summary).await?;
 
+    if !summary.tool_call_observed {
+        eprintln!(
+            "[WARN] Tool call was NOT observed. \
+             Set RIG_REQUIRE_TOOL_CALL=1 to make this a hard failure."
+        );
+    }
+    if std::env::var("RIG_REQUIRE_TOOL_CALL").as_deref() == Ok("1") {
+        ensure!(summary.tool_call_observed, "tool call not observed");
+        ensure!(
+            summary.tool_roundtrip_completed,
+            "tool roundtrip not completed"
+        );
+    }
+
     println!("{summary}");
 
     Ok(())
