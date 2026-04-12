@@ -5,7 +5,9 @@ use anyhow::{Context, ensure};
 use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
-use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
+use rig::message::{
+    AssistantContent, ImageMediaType, Message, ToolChoice, ToolResultContent, UserContent,
+};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -41,12 +43,19 @@ impl fmt::Display for RunSummary {
     }
 }
 
-fn default_model_path() -> PathBuf {
-    std::env::var("MODEL_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Qwen3.5-2B-Q4_K_M.gguf")
-        })
+fn detect_image_media_type(path: &std::path::Path) -> ImageMediaType {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => ImageMediaType::JPEG,
+        Some("png") => ImageMediaType::PNG,
+        Some("gif") => ImageMediaType::GIF,
+        Some("webp") => ImageMediaType::WEBP,
+        _ => ImageMediaType::JPEG,
+    }
 }
 
 fn required_model_path(name: &str) -> anyhow::Result<PathBuf> {
@@ -323,9 +332,9 @@ async fn attempt_tool_call(model: &Model, summary: &mut RunSummary) -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "loads the local Qwen GGUF and generates a long validation transcript"]
-async fn qwen35_e2e_inference_streaming_completion() -> anyhow::Result<()> {
-    let model_path = default_model_path();
+#[ignore = "loads a local GGUF model (set MODEL_PATH) and generates a long validation transcript"]
+async fn e2e_inference_streaming_completion() -> anyhow::Result<()> {
+    let model_path = required_model_path("MODEL_PATH")?;
     ensure!(
         model_path.is_file(),
         "model file not found at {}",
@@ -533,11 +542,12 @@ async fn embedding_basic() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a vision GGUF model, mmproj, and image file"]
 async fn vision_basic() -> anyhow::Result<()> {
-    use rig::message::{DocumentSourceKind, Image, ImageMediaType};
+    use rig::message::{DocumentSourceKind, Image};
 
     let model_path = required_model_path("MODEL_PATH")?;
     let mmproj_path = required_model_path("MMPROJ_PATH")?;
     let image_path = required_model_path("IMAGE_PATH")?;
+    let media_type = detect_image_media_type(&image_path);
 
     ensure!(
         model_path.is_file(),
@@ -573,7 +583,7 @@ async fn vision_basic() -> anyhow::Result<()> {
         .completion_request("Describe this image briefly.")
         .messages(vec![Message::from(OneOrMany::many(vec![
             UserContent::Image(Image {
-                media_type: Some(ImageMediaType::PNG),
+                media_type: Some(media_type),
                 data: DocumentSourceKind::Raw(image_bytes),
                 detail: None,
                 additional_params: None,
@@ -600,5 +610,184 @@ async fn vision_basic() -> anyhow::Result<()> {
         &response.raw_response.text[..response.raw_response.text.len().min(100)]
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Focused integration tests: thinking and tool calling per model
+// ---------------------------------------------------------------------------
+
+/// Helper: load a model from a path relative to the crate root.
+fn load_model(gguf: &str) -> anyhow::Result<(Client, Model)> {
+    let path = PathBuf::from(gguf);
+    ensure!(path.is_file(), "model file not found: {gguf}");
+    let client = Client::from_gguf(
+        gguf.to_string(),
+        env_parse_u32("N_CTX", 8192),
+        SamplingParams::default(),
+        FitParams::default(),
+    )?;
+    let model = client.completion_model("local");
+    Ok((client, model))
+}
+
+/// Helper: run a completion with thinking enabled and return (has_reasoning, has_text, raw).
+async fn completion_with_thinking(
+    model: &Model,
+    prompt: &str,
+    preamble: &str,
+) -> anyhow::Result<(bool, bool, String)> {
+    let response = model
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .max_tokens(2048)
+        .temperature(0.3)
+        .additional_params(json!({ "thinking": true }))
+        .send()
+        .await?;
+
+    let has_reasoning = response
+        .choice
+        .iter()
+        .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+    let has_text = response
+        .choice
+        .iter()
+        .any(|c| matches!(c, AssistantContent::Text(_)));
+    Ok((has_reasoning, has_text, response.raw_response.text))
+}
+
+/// Helper: run a tool-call roundtrip and return (tool_name, follow_up_text).
+async fn tool_roundtrip(model: &Model) -> anyhow::Result<(String, String)> {
+    let tool = ToolDefinition {
+        name: "get_time".to_string(),
+        description: "Return the current UTC time as plain text.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+    };
+
+    let prompt = "What time is it? Call get_time to find out.";
+    let response = model
+        .completion_request(prompt)
+        .preamble("You have access to tools. Use them when needed.".to_string())
+        .tool(tool)
+        .max_tokens(256)
+        .temperature(0.0)
+        .additional_params(json!({ "thinking": true }))
+        .send()
+        .await?;
+
+    let tool_call = response
+        .choice
+        .iter()
+        .find_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .context("model did not produce a tool call")?;
+
+    let tool_name = tool_call.function.name.clone();
+
+    let tool_result = Message::from(UserContent::tool_result_with_call_id(
+        "tool-result-utc",
+        tool_call
+            .call_id
+            .clone()
+            .unwrap_or_else(|| tool_call.id.clone()),
+        OneOrMany::one(ToolResultContent::text(
+            "Current time: 2026-04-12 15:30:00 UTC",
+        )),
+    ));
+
+    let follow_up = model
+        .completion_request("Use the tool result to answer briefly.")
+        .preamble("Answer using the tool result provided.".to_string())
+        .messages(vec![
+            Message::user(prompt),
+            Message::from(tool_call),
+            tool_result,
+        ])
+        .max_tokens(128)
+        .temperature(0.0)
+        .additional_params(json!({ "thinking": true }))
+        .send()
+        .await?;
+
+    let text = assistant_text(&follow_up.choice);
+    Ok((tool_name, text))
+}
+
+// --- Qwen3.5 tests ---
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Qwen3.5-2B-Q4_K_M.gguf in cwd"]
+async fn qwen_thinking() -> anyhow::Result<()> {
+    let (_client, model) = load_model("./Qwen3.5-2B-Q4_K_M.gguf")?;
+    let (has_reasoning, has_text, raw) = completion_with_thinking(
+        &model,
+        "Explain why the sky is blue in one sentence.",
+        "You are a helpful assistant.",
+    )
+    .await?;
+
+    println!("qwen_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}", raw.len());
+    ensure!(has_reasoning, "Qwen should produce reasoning content with thinking enabled");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Qwen3.5-2B-Q4_K_M.gguf in cwd"]
+async fn qwen_tool_roundtrip() -> anyhow::Result<()> {
+    let (_client, model) = load_model("./Qwen3.5-2B-Q4_K_M.gguf")?;
+    let (tool_name, follow_up) = tool_roundtrip(&model).await?;
+
+    println!("qwen_tool_roundtrip: called={tool_name}, follow_up_len={}", follow_up.len());
+    ensure!(
+        tool_name == "get_time",
+        "Qwen called wrong tool: {tool_name}"
+    );
+    ensure!(
+        !follow_up.trim().is_empty(),
+        "Qwen follow-up after tool result was empty"
+    );
+    Ok(())
+}
+
+// --- Gemma-4 tests ---
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires gemma-4-E4B-it-Q4_K_M.gguf in cwd"]
+async fn gemma_thinking() -> anyhow::Result<()> {
+    let (_client, model) = load_model("./gemma-4-E4B-it-Q4_K_M.gguf")?;
+    let (has_reasoning, has_text, raw) = completion_with_thinking(
+        &model,
+        "Explain why the sky is blue in one sentence.",
+        "You are a helpful assistant.",
+    )
+    .await?;
+
+    println!("gemma_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}", raw.len());
+    ensure!(has_reasoning, "Gemma-4 should produce reasoning content with thinking enabled");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires gemma-4-E4B-it-Q4_K_M.gguf in cwd"]
+async fn gemma_tool_roundtrip() -> anyhow::Result<()> {
+    let (_client, model) = load_model("./gemma-4-E4B-it-Q4_K_M.gguf")?;
+    let (tool_name, follow_up) = tool_roundtrip(&model).await?;
+
+    println!("gemma_tool_roundtrip: called={tool_name}, follow_up_len={}", follow_up.len());
+    ensure!(
+        tool_name == "get_time",
+        "Gemma-4 called wrong tool: {tool_name}"
+    );
+    ensure!(
+        !follow_up.trim().is_empty(),
+        "Gemma-4 follow-up after tool result was empty"
+    );
     Ok(())
 }

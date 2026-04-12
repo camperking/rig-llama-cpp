@@ -1259,7 +1259,14 @@ fn build_preserved_token_set(
         if let Ok(ids) = model.str_to_token(token_str, AddBos::Never) {
             if ids.len() == 1 {
                 set.insert(ids[0]);
+            } else if llama_logs_enabled() {
+                eprintln!(
+                    "[rig-llama-cpp] preserved token {token_str:?} tokenized to {} ids (expected 1), skipping",
+                    ids.len()
+                );
             }
+        } else if llama_logs_enabled() {
+            eprintln!("[rig-llama-cpp] preserved token {token_str:?} not found in vocabulary");
         }
     }
     if llama_logs_enabled() && !set.is_empty() {
@@ -1292,6 +1299,17 @@ fn regex_escape(s: &str) -> String {
     escaped
 }
 
+/// Result of building a sampler chain: the chain itself plus whether grammar is active.
+///
+/// When grammar is present, `llama_sampler_sample()` already calls `accept()` internally
+/// and we must NOT call it again (double-accept corrupts grammar state). When grammar is
+/// absent, we call `accept()` explicitly after `sample()` to preserve the legacy
+/// double-accept behavior that the base samplers were tuned around.
+struct SamplerChain {
+    sampler: llama_cpp_2::sampling::LlamaSampler,
+    has_grammar: bool,
+}
+
 /// Build a sampler chain with optional grammar constraints from the chat template.
 ///
 /// When `ChatTemplateResult` provides a grammar (e.g. for tool-call output), the grammar
@@ -1301,7 +1319,7 @@ fn build_sampler_chain(
     model: &llama_cpp_2::model::LlamaModel,
     template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
     req: &InferenceParams,
-) -> llama_cpp_2::sampling::LlamaSampler {
+) -> SamplerChain {
     use llama_cpp_2::model::GrammarTriggerType;
     use llama_cpp_2::sampling::LlamaSampler;
 
@@ -1393,12 +1411,16 @@ fn build_sampler_chain(
             }
         });
 
+    let has_grammar = grammar_sampler.is_some();
     let mut samplers = Vec::with_capacity(7);
     if let Some(gs) = grammar_sampler {
         samplers.push(gs);
     }
     samplers.extend(base_samplers);
-    LlamaSampler::chain_simple(samplers)
+    SamplerChain {
+        sampler: LlamaSampler::chain_simple(samplers),
+        has_grammar,
+    }
 }
 
 #[cfg(feature = "mtmd")]
@@ -1412,7 +1434,8 @@ fn sample_tokens_from_pos(
     prompt_tokens: u64,
     n_past: i32,
 ) -> Result<InferenceResult, String> {
-    let mut sampler = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
+    let SamplerChain { mut sampler, has_grammar } =
+        build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
 
     let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
     let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
@@ -1446,6 +1469,13 @@ fn sample_tokens_from_pos(
             batch.n_tokens() - 1
         };
         let token = sampler.sample(ctx, sample_idx);
+        // sample() internally calls accept(). When there is no grammar sampler,
+        // accept again to preserve legacy double-accept that base samplers were
+        // calibrated with. Skip when grammar is present to avoid corrupting its
+        // parser state.
+        if !has_grammar {
+            sampler.accept(token);
+        }
 
         if model.is_eog_token(token) {
             break;
@@ -1493,6 +1523,10 @@ fn sample_tokens_from_pos(
         n_cur += 1;
     }
 
+    if llama_logs_enabled() {
+        eprintln!("[rig-llama-cpp] raw output:\n{output}");
+    }
+
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
         if let Some(parser) = stream_parser.as_mut()
@@ -1532,7 +1566,8 @@ fn sample_tokens(
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
 ) -> Result<InferenceResult, String> {
-    let mut sampler = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
+    let SamplerChain { mut sampler, has_grammar } =
+        build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
 
     let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
     let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
@@ -1562,6 +1597,9 @@ fn sample_tokens(
         }
 
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
+        if !has_grammar {
+            sampler.accept(token);
+        }
 
         if model.is_eog_token(token) {
             break;
@@ -1607,6 +1645,10 @@ fn sample_tokens(
         ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
         n_cur += 1;
+    }
+
+    if llama_logs_enabled() {
+        eprintln!("[rig-llama-cpp] raw output:\n{output}");
     }
 
     // Flush remaining deltas from the streaming parser
@@ -1932,6 +1974,13 @@ fn build_prompt(
             Ok(result) => {
                 if llama_logs_enabled() {
                     eprintln!("[rig-llama-cpp] messages_json: {}", request.messages_json);
+                    eprintln!("[rig-llama-cpp] enable_thinking: {}", request.enable_thinking);
+                    eprintln!("[rig-llama-cpp] chat_format: {}", result.chat_format);
+                    eprintln!("[rig-llama-cpp] has_parser: {}", result.parser.is_some());
+                    eprintln!(
+                        "[rig-llama-cpp] prompt contains <|think|>: {}",
+                        result.prompt.contains("<|think|>")
+                    );
                     eprintln!("[rig-llama-cpp] rendered prompt:\n{}", result.prompt);
                 }
                 return Ok(PromptBuildResult {
