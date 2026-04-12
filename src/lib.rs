@@ -647,25 +647,65 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                 }));
             }
 
-            for tool_result in content.iter().filter_map(|c| match c {
-                UserContent::ToolResult(tool_result) => Some(tool_result),
-                _ => None,
-            }) {
-                let content = tool_result
-                    .content
-                    .iter()
-                    .filter_map(|part| match part {
-                        rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            let tool_results: Vec<_> = content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::ToolResult(tool_result) => Some(tool_result),
+                    _ => None,
+                })
+                .collect();
 
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_result.call_id.as_deref().unwrap_or(&tool_result.id),
-                    "content": content,
-                }));
+            if !tool_results.is_empty() {
+                // Some chat templates (e.g. Gemma) require tool results to be preceded
+                // by an assistant message with matching tool_calls. Rig's agent loop
+                // may not always include this, so synthesize one when missing.
+                let has_preceding_tool_calls = messages
+                    .last()
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty());
+
+                if !has_preceding_tool_calls {
+                    let synthetic_tool_calls: Vec<Value> = tool_results
+                        .iter()
+                        .map(|tr| {
+                            json!({
+                                "id": tr.call_id.as_deref().unwrap_or(&tr.id),
+                                "type": "function",
+                                "function": {
+                                    "name": tr.id,
+                                    "arguments": "{}",
+                                }
+                            })
+                        })
+                        .collect();
+
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": synthetic_tool_calls,
+                    }));
+                }
+
+                for tool_result in tool_results {
+                    let content = tool_result
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            rig::message::ToolResultContent::Text(text) => {
+                                Some(text.text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_result.call_id.as_deref().unwrap_or(&tool_result.id),
+                        "content": content,
+                    }));
+                }
             }
         }
         Message::Assistant { content, .. } => {
@@ -1723,11 +1763,22 @@ fn build_prompt(
             parse_tool_calls: request.tools_json.is_some(),
         };
 
-        if let Ok(result) = model.apply_chat_template_oaicompat(&tmpl, &params) {
-            return Ok(PromptBuildResult {
-                prompt: result.prompt.clone(),
-                template_result: Some(result),
-            });
+        match model.apply_chat_template_oaicompat(&tmpl, &params) {
+            Ok(result) => {
+                if llama_logs_enabled() {
+                    eprintln!("[rig-llama-cpp] messages_json: {}", request.messages_json);
+                    eprintln!("[rig-llama-cpp] rendered prompt:\n{}", result.prompt);
+                }
+                return Ok(PromptBuildResult {
+                    prompt: result.prompt.clone(),
+                    template_result: Some(result),
+                });
+            }
+            Err(e) => {
+                if llama_logs_enabled() {
+                    eprintln!("[rig-llama-cpp] apply_chat_template_oaicompat failed: {e}, falling back");
+                }
+            }
         }
     }
 
