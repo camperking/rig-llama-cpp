@@ -907,6 +907,8 @@ fn inference_worker(
 
     if !logs_enabled {
         backend.void_logs();
+        #[cfg(feature = "mtmd")]
+        llama_cpp_2::mtmd::void_mtmd_logs();
     }
 
     let mut wm = match fit_and_load_model(
@@ -2080,6 +2082,8 @@ fn embedding_worker(
 
     if !logs_enabled {
         backend.void_logs();
+        #[cfg(feature = "mtmd")]
+        llama_cpp_2::mtmd::void_mtmd_logs();
     }
 
     let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
