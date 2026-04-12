@@ -1280,6 +1280,127 @@ fn get_additional_stops(
         .unwrap_or_default()
 }
 
+/// Escape regex metacharacters in a string (for Word-type grammar triggers).
+fn regex_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if r"\.^$*+?()[]{}|".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Build a sampler chain with optional grammar constraints from the chat template.
+///
+/// When `ChatTemplateResult` provides a grammar (e.g. for tool-call output), the grammar
+/// sampler is prepended to the chain so invalid tokens are zeroed before other samplers rank
+/// the remaining candidates.
+fn build_sampler_chain(
+    model: &llama_cpp_2::model::LlamaModel,
+    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+    req: &InferenceParams,
+) -> llama_cpp_2::sampling::LlamaSampler {
+    use llama_cpp_2::model::GrammarTriggerType;
+    use llama_cpp_2::sampling::LlamaSampler;
+
+    let base_samplers = vec![
+        LlamaSampler::top_k(req.top_k),
+        LlamaSampler::top_p(req.top_p, 1),
+        LlamaSampler::min_p(req.min_p, 1),
+        LlamaSampler::temp(req.temperature),
+        LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
+        LlamaSampler::dist(42),
+    ];
+
+    // Attempt to create a grammar sampler from the template result.
+    let grammar_sampler = template_result
+        .and_then(|tr| tr.grammar.as_ref().map(|g| (g, tr)))
+        .and_then(|(grammar_str, tr)| {
+            let result = if tr.grammar_lazy {
+                // Convert triggers into patterns and tokens for lazy grammar.
+                let mut trigger_patterns = Vec::new();
+                let mut trigger_tokens = Vec::new();
+
+                for trigger in &tr.grammar_triggers {
+                    match trigger.trigger_type {
+                        GrammarTriggerType::Token => {
+                            if let Some(tok) = trigger.token {
+                                trigger_tokens.push(tok);
+                            }
+                        }
+                        GrammarTriggerType::Word => {
+                            trigger_patterns.push(regex_escape(&trigger.value));
+                        }
+                        GrammarTriggerType::Pattern => {
+                            trigger_patterns.push(trigger.value.clone());
+                        }
+                        GrammarTriggerType::PatternFull => {
+                            let mut pat = trigger.value.clone();
+                            if !pat.starts_with('^') {
+                                pat.insert(0, '^');
+                            }
+                            if !pat.ends_with('$') {
+                                pat.push('$');
+                            }
+                            trigger_patterns.push(pat);
+                        }
+                    }
+                }
+
+                if trigger_patterns.is_empty() && trigger_tokens.is_empty() {
+                    // No triggers means lazy grammar would never activate; fall back to eager.
+                    if llama_logs_enabled() {
+                        eprintln!(
+                            "[rig-llama-cpp] grammar_lazy is true but no triggers found, \
+                             falling back to eager grammar"
+                        );
+                    }
+                    LlamaSampler::grammar(model, grammar_str, "root")
+                } else {
+                    LlamaSampler::grammar_lazy_patterns(
+                        model,
+                        grammar_str,
+                        "root",
+                        &trigger_patterns,
+                        &trigger_tokens,
+                    )
+                }
+            } else {
+                LlamaSampler::grammar(model, grammar_str, "root")
+            };
+
+            match result {
+                Ok(sampler) => {
+                    if llama_logs_enabled() {
+                        eprintln!(
+                            "[rig-llama-cpp] grammar sampler created (lazy={})",
+                            tr.grammar_lazy
+                        );
+                    }
+                    Some(sampler)
+                }
+                Err(e) => {
+                    if llama_logs_enabled() {
+                        eprintln!(
+                            "[rig-llama-cpp] grammar sampler creation failed, \
+                             falling back to unconstrained sampling: {e}"
+                        );
+                    }
+                    None
+                }
+            }
+        });
+
+    let mut samplers = Vec::with_capacity(7);
+    if let Some(gs) = grammar_sampler {
+        samplers.push(gs);
+    }
+    samplers.extend(base_samplers);
+    LlamaSampler::chain_simple(samplers)
+}
+
 #[cfg(feature = "mtmd")]
 fn sample_tokens_from_pos(
     model: &llama_cpp_2::model::LlamaModel,
@@ -1291,16 +1412,7 @@ fn sample_tokens_from_pos(
     prompt_tokens: u64,
     n_past: i32,
 ) -> Result<InferenceResult, String> {
-    use llama_cpp_2::sampling::LlamaSampler;
-
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::top_k(req.top_k),
-        LlamaSampler::top_p(req.top_p, 1),
-        LlamaSampler::min_p(req.min_p, 1),
-        LlamaSampler::temp(req.temperature),
-        LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
-        LlamaSampler::dist(42),
-    ]);
+    let mut sampler = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
 
     let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
     let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
@@ -1334,7 +1446,6 @@ fn sample_tokens_from_pos(
             batch.n_tokens() - 1
         };
         let token = sampler.sample(ctx, sample_idx);
-        sampler.accept(token);
 
         if model.is_eog_token(token) {
             break;
@@ -1421,16 +1532,7 @@ fn sample_tokens(
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
 ) -> Result<InferenceResult, String> {
-    use llama_cpp_2::sampling::LlamaSampler;
-
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::top_k(req.top_k),
-        LlamaSampler::top_p(req.top_p, 1),
-        LlamaSampler::min_p(req.min_p, 1),
-        LlamaSampler::temp(req.temperature),
-        LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
-        LlamaSampler::dist(42),
-    ]);
+    let mut sampler = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
 
     let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
     let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
@@ -1460,7 +1562,6 @@ fn sample_tokens(
         }
 
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
 
         if model.is_eog_token(token) {
             break;
