@@ -94,6 +94,11 @@ MODEL_PATH="./$GEMMA_MODEL" \
 MODEL_PATH="./$GEMMA_MODEL" \
     cargo test gemma_tool_roundtrip -- --ignored --nocapture
 
+# ── KV cache quantization ────────────────────────────────────────────
+section "KV cache Q8_0 — Qwen 3.5-2B"
+MODEL_PATH="./$QWEN_MODEL" \
+    cargo test e2e_kv_cache_q8_0 -- --ignored --nocapture
+
 # ── Embedding ────────────────────────────────────────────────────────
 section "Embedding — nomic-embed-text-v2-moe"
 EMBEDDING_MODEL_PATH="./$EMBED_MODEL" \

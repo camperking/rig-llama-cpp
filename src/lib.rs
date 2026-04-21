@@ -38,7 +38,7 @@
 //! ```rust,no_run
 //! use rig::client::CompletionClient;
 //! use rig::completion::Prompt;
-//! use rig_llama_cpp::{FitParams, SamplingParams};
+//! use rig_llama_cpp::{FitParams, KvCacheParams, SamplingParams};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), anyhow::Error> {
@@ -47,6 +47,7 @@
 //!     8192, // n_ctx
 //!     SamplingParams::default(),
 //!     FitParams::default(),
+//!     KvCacheParams::default(),
 //! )?;
 //!
 //! let agent = client
@@ -71,7 +72,8 @@ mod embedding;
 #[cfg(test)]
 mod test;
 
-pub use types::{RawResponse, StreamChunk, SamplingParams, FitParams};
+pub use types::{RawResponse, StreamChunk, SamplingParams, FitParams, KvCacheParams};
+pub use llama_cpp_2::context::params::KvCacheType;
 pub use client::{Client, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
 

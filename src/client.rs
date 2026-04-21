@@ -10,8 +10,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::request::prepare_request;
 use crate::types::{
-    FitParams, InferenceCommand, InferenceParams, InferenceRequest, RawResponse, ReloadRequest,
-    ResponseChannel, SamplingParams, StreamChunk,
+    FitParams, InferenceCommand, InferenceParams, InferenceRequest, KvCacheParams, RawResponse,
+    ReloadRequest, ResponseChannel, SamplingParams, StreamChunk,
 };
 use crate::worker::inference_worker;
 
@@ -37,6 +37,7 @@ impl Client {
     /// * `n_ctx` — Desired context window size in tokens.
     /// * `sampling_params` — Sampling parameters for token generation.
     /// * `fit_params` — Configuration for the fitting algorithm.
+    /// * `kv_cache_params` — KV cache data-type configuration (defaults to F16/F16).
     ///
     /// # Errors
     ///
@@ -46,6 +47,7 @@ impl Client {
         n_ctx: u32,
         sampling_params: SamplingParams,
         fit_params: FitParams,
+        kv_cache_params: KvCacheParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
@@ -57,6 +59,7 @@ impl Client {
                 None,
                 n_ctx,
                 &fit_params,
+                &kv_cache_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -86,6 +89,7 @@ impl Client {
     /// * `n_ctx` — Desired context window size in tokens.
     /// * `sampling_params` — Sampling parameters for token generation.
     /// * `fit_params` — Configuration for the fitting algorithm.
+    /// * `kv_cache_params` — KV cache data-type configuration (defaults to F16/F16).
     ///
     /// # Errors
     ///
@@ -98,6 +102,7 @@ impl Client {
         n_ctx: u32,
         sampling_params: SamplingParams,
         fit_params: FitParams,
+        kv_cache_params: KvCacheParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let mmproj_path = mmproj_path.into();
@@ -110,6 +115,7 @@ impl Client {
                 Some(&mmproj_path),
                 n_ctx,
                 &fit_params,
+                &kv_cache_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -139,6 +145,7 @@ impl Client {
         n_ctx: u32,
         sampling: SamplingParams,
         fit_params: FitParams,
+        kv_cache_params: KvCacheParams,
     ) -> Result<(), String> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         self.request_tx
@@ -147,6 +154,7 @@ impl Client {
                 mmproj_path,
                 n_ctx,
                 fit_params,
+                kv_cache_params,
                 result_tx,
             }))
             .map_err(|_| "Worker thread not running".to_string())?;

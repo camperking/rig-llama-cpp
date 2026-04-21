@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::parsing::parse_completion_output;
 use crate::types::{
-    FitParams, InferenceCommand, InferenceParams, InferenceResult, PreparedRequest,
+    FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams, PreparedRequest,
     PromptBuildResult, ResponseChannel, SamplerChain, StreamChunk, StreamDeltaState, StreamSender,
 };
 
@@ -19,6 +19,7 @@ struct WorkerModel {
     #[cfg(feature = "mtmd")]
     mtmd_ctx: Option<llama_cpp_2::mtmd::MtmdContext>,
     n_ctx: u32,
+    kv_cache: KvCacheParams,
 }
 
 /// Load a model with automatic parameter fitting to available device memory.
@@ -28,6 +29,7 @@ fn fit_and_load_model(
     mmproj_path: Option<&str>,
     n_ctx: u32,
     fit: &FitParams,
+    kv_cache: &KvCacheParams,
     logs_enabled: bool,
 ) -> Result<WorkerModel, String> {
     use llama_cpp_2::list_llama_ggml_backend_devices;
@@ -132,6 +134,7 @@ fn fit_and_load_model(
         #[cfg(feature = "mtmd")]
         mtmd_ctx,
         n_ctx: actual_n_ctx,
+        kv_cache: *kv_cache,
     })
 }
 
@@ -140,6 +143,7 @@ pub(crate) fn inference_worker(
     mmproj_path: Option<&str>,
     n_ctx: u32,
     fit_params: &FitParams,
+    kv_cache_params: &KvCacheParams,
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
@@ -166,6 +170,7 @@ pub(crate) fn inference_worker(
         mmproj_path,
         n_ctx,
         fit_params,
+        kv_cache_params,
         logs_enabled,
     ) {
         Ok(wm) => wm,
@@ -194,8 +199,15 @@ pub(crate) fn inference_worker(
 
                 match response_channel {
                     ResponseChannel::Completion(tx) => {
-                        let result =
-                            run_inference(&backend, &wm.model, wm.n_ctx, &params, None, mtmd_ref);
+                        let result = run_inference(
+                            &backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &wm.kv_cache,
+                            &params,
+                            None,
+                            mtmd_ref,
+                        );
                         let _ = tx.send(result);
                     }
                     ResponseChannel::Streaming(stream_tx) => {
@@ -203,6 +215,7 @@ pub(crate) fn inference_worker(
                             &backend,
                             &wm.model,
                             wm.n_ctx,
+                            &wm.kv_cache,
                             &params,
                             Some(&stream_tx),
                             mtmd_ref,
@@ -233,6 +246,7 @@ pub(crate) fn inference_worker(
                     reload.mmproj_path.as_deref(),
                     reload.n_ctx,
                     &reload.fit_params,
+                    &reload.kv_cache_params,
                     logs_enabled,
                 );
 
@@ -257,11 +271,12 @@ fn run_inference(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    kv_cache: &KvCacheParams,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
 ) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, req, stream_tx, mtmd_ctx)
+    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
 }
 
 #[cfg(not(feature = "mtmd"))]
@@ -269,11 +284,12 @@ fn run_inference(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    kv_cache: &KvCacheParams,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     _mtmd_ctx: Option<&()>,
 ) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, req, stream_tx)
+    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx)
 }
 
 #[cfg(not(feature = "mtmd"))]
@@ -281,6 +297,7 @@ fn run_inference_inner(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    kv_cache: &KvCacheParams,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
@@ -291,8 +308,10 @@ fn run_inference_inner(
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let ctx_params =
-        LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None));
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_type_k(kv_cache.type_k)
+        .with_type_v(kv_cache.type_v);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| format!("Context creation failed: {e}"))?;
@@ -338,6 +357,7 @@ fn run_inference_inner(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    kv_cache: &KvCacheParams,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
@@ -349,8 +369,10 @@ fn run_inference_inner(
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let ctx_params =
-        LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None));
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_type_k(kv_cache.type_k)
+        .with_type_v(kv_cache.type_v);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| format!("Context creation failed: {e}"))?;

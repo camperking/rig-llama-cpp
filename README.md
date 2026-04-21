@@ -42,15 +42,16 @@ native toolchain or system libraries being available on the host machine.
 ```rust
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig_llama_cpp::{ Client, SamplingParams };
+use rig_llama_cpp::{ Client, FitParams, KvCacheParams, SamplingParams };
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let client = Client::from_gguf(
         "path/to/model.gguf",
-        99,   // n_gpu_layers (u32::MAX for all)
         8192, // n_ctx
         SamplingParams::default(),
+        FitParams::default(),
+        KvCacheParams::default(), // F16 K + F16 V — try KvCacheType::Q8_0 to halve KV VRAM
     )?;
 
     let agent = client

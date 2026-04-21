@@ -13,7 +13,7 @@ async fn main() -> Result<(), anyhow::Error> {
     use rig::client::CompletionClient;
     use rig::completion::CompletionModel;
     use rig::message::{DocumentSourceKind, Image, ImageMediaType, Message, UserContent};
-    use rig_llama_cpp::{Client, FitParams, SamplingParams};
+    use rig_llama_cpp::{Client, FitParams, KvCacheParams, SamplingParams};
 
     let model_path =
         std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your vision GGUF model");
@@ -30,6 +30,7 @@ async fn main() -> Result<(), anyhow::Error> {
         8192,
         SamplingParams::default(),
         FitParams::default(),
+        KvCacheParams::default(),
     )?;
 
     let model = client.completion_model("local");

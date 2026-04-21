@@ -61,6 +61,7 @@ pub(crate) struct ReloadRequest {
     pub mmproj_path: Option<String>,
     pub n_ctx: u32,
     pub fit_params: FitParams,
+    pub kv_cache_params: KvCacheParams,
     pub result_tx: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
@@ -158,6 +159,39 @@ impl Default for FitParams {
         Self {
             margins: None,
             n_ctx_min: 4096,
+        }
+    }
+}
+
+/// KV cache quantization configuration.
+///
+/// Controls the data type used for the attention K and V caches. llama.cpp defaults
+/// both to `F16` (`GGML_TYPE_F16`), which is what `KvCacheParams::default()` preserves.
+/// Quantizing the KV cache (e.g. `Q8_0` → ~½ size, `Q4_0` → ~¼ size) trades a small
+/// amount of accuracy for a large reduction in VRAM usage, which is often the dominant
+/// cost at long `n_ctx`.
+///
+/// ```
+/// use rig_llama_cpp::{KvCacheParams, KvCacheType};
+///
+/// let kv = KvCacheParams {
+///     type_k: KvCacheType::Q8_0,
+///     type_v: KvCacheType::Q8_0,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct KvCacheParams {
+    /// Data type for the K cache (default: `KvCacheType::F16`).
+    pub type_k: llama_cpp_2::context::params::KvCacheType,
+    /// Data type for the V cache (default: `KvCacheType::F16`).
+    pub type_v: llama_cpp_2::context::params::KvCacheType,
+}
+
+impl Default for KvCacheParams {
+    fn default() -> Self {
+        Self {
+            type_k: llama_cpp_2::context::params::KvCacheType::F16,
+            type_v: llama_cpp_2::context::params::KvCacheType::F16,
         }
     }
 }

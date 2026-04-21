@@ -14,7 +14,7 @@ use tokio_stream::StreamExt;
 
 use rig::embeddings::EmbeddingModel as _;
 
-use crate::{Client, EmbeddingClient, FitParams, Model, SamplingParams};
+use crate::{Client, EmbeddingClient, FitParams, KvCacheParams, KvCacheType, Model, SamplingParams};
 
 #[derive(Debug, Default)]
 struct RunSummary {
@@ -352,6 +352,7 @@ async fn e2e_inference_streaming_completion() -> anyhow::Result<()> {
         n_ctx,
         SamplingParams::default(),
         FitParams::default(),
+        KvCacheParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -451,6 +452,46 @@ async fn e2e_inference_streaming_completion() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "loads a local GGUF model (set MODEL_PATH) with Q8_0 KV cache quantization"]
+async fn e2e_kv_cache_q8_0() -> anyhow::Result<()> {
+    let model_path = required_model_path("MODEL_PATH")?;
+    ensure!(
+        model_path.is_file(),
+        "model file not found at {}",
+        model_path.display()
+    );
+
+    let n_ctx = env_parse_u32("N_CTX", 8192);
+
+    let client = Client::from_gguf(
+        model_path.to_string_lossy().into_owned(),
+        n_ctx,
+        SamplingParams::default(),
+        FitParams::default(),
+        KvCacheParams {
+            type_k: KvCacheType::Q8_0,
+            type_v: KvCacheType::Q8_0,
+        },
+    )?;
+    let model = client.completion_model("local");
+
+    let response = model
+        .completion_request("Reply with exactly: kv cache ok")
+        .max_tokens(32)
+        .temperature(0.0)
+        .send()
+        .await?;
+    ensure!(
+        !response.raw_response.text.trim().is_empty(),
+        "Q8_0 KV cache completion returned empty text"
+    );
+
+    println!("Q8_0 KV cache response: {}", response.raw_response.text);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "loads two real GGUF models sequentially to validate backend reinitialization"]
 fn sequential_real_model_reload() -> anyhow::Result<()> {
@@ -475,6 +516,7 @@ fn sequential_real_model_reload() -> anyhow::Result<()> {
             n_ctx,
             SamplingParams::default(),
             FitParams::default(),
+            KvCacheParams::default(),
         )?;
     }
 
@@ -483,6 +525,7 @@ fn sequential_real_model_reload() -> anyhow::Result<()> {
         n_ctx,
         SamplingParams::default(),
         FitParams::default(),
+        KvCacheParams::default(),
     )?;
 
     Ok(())
@@ -590,6 +633,7 @@ async fn vision_basic() -> anyhow::Result<()> {
         n_ctx,
         SamplingParams::default(),
         FitParams::default(),
+        KvCacheParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -640,6 +684,7 @@ fn load_model(gguf: &str) -> anyhow::Result<(Client, Model)> {
         env_parse_u32("N_CTX", 8192),
         SamplingParams::default(),
         FitParams::default(),
+        KvCacheParams::default(),
     )?;
     let model = client.completion_model("local");
     Ok((client, model))
