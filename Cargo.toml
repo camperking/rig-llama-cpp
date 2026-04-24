@@ -13,7 +13,7 @@ rocm = ["llama-cpp-2/rocm"]
 mtmd = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
-rig-core = "0.34.0"
+rig-core = "0.35.0"
 llama-cpp-2 = { git = "https://github.com/camperking/llama-cpp-rs.git" }
 llama-cpp-sys-2 = { git = "https://github.com/camperking/llama-cpp-rs.git" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
