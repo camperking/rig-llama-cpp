@@ -768,7 +768,11 @@ fn sample_tokens_from_pos(
     let choice = if stream_tx.is_some() {
         OneOrMany::one(AssistantContent::text(output.clone()))
     } else {
-        parse_completion_output(&output, prompt_build.template_result.as_ref())?
+        parse_completion_output(
+            &output,
+            prompt_build.template_result.as_ref(),
+            req.prepared_request.json_schema.is_some(),
+        )?
     };
 
     Ok(InferenceResult {
@@ -897,7 +901,11 @@ fn sample_tokens(
         // return a minimal placeholder for InferenceResult
         OneOrMany::one(AssistantContent::text(output.clone()))
     } else {
-        parse_completion_output(&output, prompt_build.template_result.as_ref())?
+        parse_completion_output(
+            &output,
+            prompt_build.template_result.as_ref(),
+            req.prepared_request.json_schema.is_some(),
+        )?
     };
 
     Ok(InferenceResult {

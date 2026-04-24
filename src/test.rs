@@ -15,6 +15,9 @@ use tokio_stream::StreamExt;
 use rig::embeddings::EmbeddingModel as _;
 
 use crate::{Client, EmbeddingClient, FitParams, KvCacheParams, KvCacheType, Model, SamplingParams};
+use rig::completion::TypedPrompt;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 #[derive(Debug, Default)]
 struct RunSummary {
@@ -815,6 +818,42 @@ async fn qwen_tool_roundtrip() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ExtractedPerson {
+    name: String,
+    age: u32,
+    occupation: String,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Qwen3.5-2B-Q4_K_M.gguf in cwd"]
+async fn qwen_structured_output() -> anyhow::Result<()> {
+    let (client, _model) = load_model("./Qwen3.5-2B-Q4_K_M.gguf")?;
+    let agent = client
+        .agent("local")
+        .preamble("Extract the single person described in the user's text as structured data.")
+        .max_tokens(256)
+        .temperature(0.2)
+        .build();
+
+    let person: ExtractedPerson = agent
+        .prompt_typed("Ada is a 36-year-old software engineer living in Berlin.")
+        .await?;
+
+    println!(
+        "qwen_structured_output: name={}, age={}, occupation={}",
+        person.name, person.age, person.occupation
+    );
+    ensure!(!person.name.is_empty(), "Qwen structured output: name was empty");
+    ensure!(person.age > 0, "Qwen structured output: age was zero");
+    ensure!(
+        !person.occupation.is_empty(),
+        "Qwen structured output: occupation was empty"
+    );
+    Ok(())
+}
+
 // --- Gemma-4 tests ---
 
 #[tokio::test(flavor = "multi_thread")]
@@ -830,6 +869,34 @@ async fn gemma_thinking() -> anyhow::Result<()> {
 
     println!("gemma_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}", raw.len());
     ensure!(has_reasoning, "Gemma-4 should produce reasoning content with thinking enabled");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires gemma-4-E4B-it-Q4_K_M.gguf in cwd"]
+async fn gemma_structured_output() -> anyhow::Result<()> {
+    let (client, _model) = load_model("./gemma-4-E4B-it-Q4_K_M.gguf")?;
+    let agent = client
+        .agent("local")
+        .preamble("Extract the single person described in the user's text as structured data.")
+        .max_tokens(256)
+        .temperature(0.2)
+        .build();
+
+    let person: ExtractedPerson = agent
+        .prompt_typed("Ada is a 36-year-old software engineer living in Berlin.")
+        .await?;
+
+    println!(
+        "gemma_structured_output: name={}, age={}, occupation={}",
+        person.name, person.age, person.occupation
+    );
+    ensure!(!person.name.is_empty(), "Gemma structured output: name was empty");
+    ensure!(person.age > 0, "Gemma structured output: age was zero");
+    ensure!(
+        !person.occupation.is_empty(),
+        "Gemma structured output: occupation was empty"
+    );
     Ok(())
 }
 

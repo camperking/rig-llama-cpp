@@ -72,6 +72,16 @@ async fn main() -> Result<(), anyhow::Error> {
 MODEL_PATH=./model.gguf cargo run --example completion
 MODEL_PATH=./model.gguf cargo run --example streaming
 MODEL_PATH=./model.gguf cargo run --example stream_chat
+MODEL_PATH=./model.gguf cargo run --example structured_output
+MODEL_PATH=./model.gguf cargo run --example kv_cache
+MODEL_PATH=./embedding-model.gguf cargo run --example embeddings
+
+# Vision (requires mtmd feature + mmproj file)
+MODEL_PATH=./vision-model.gguf MMPROJ_PATH=./mmproj.gguf IMAGE_PATH=./image.jpg \
+    cargo run --features mtmd --example vision
+
+# Hot-swap the loaded model on the same worker thread
+RIG_MODEL_A=./model_a.gguf RIG_MODEL_B=./model_b.gguf cargo run --example reload
 ```
 
 `N_GPU_LAYERS=20` can be used to offload 20 layers to the GPU.

@@ -25,3 +25,6 @@ thiserror = "2.0.18"
 chrono = "0.4.44"
 tokio-stream = "0.1"
 base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+schemars = "1"

@@ -264,10 +264,22 @@ fn parse_xml_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
 pub(crate) fn parse_completion_output(
     raw_text: &str,
     template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
+    has_json_schema: bool,
 ) -> Result<OneOrMany<AssistantContent>, String> {
     if crate::llama_logs_enabled() {
         eprintln!("[rig-llama-cpp] raw output:\n{raw_text}");
     }
+
+    // When the caller set an output schema, grammar-constrained generation produces
+    // a valid JSON object — but chat templates often wrap it in role tokens
+    // (e.g. `<|im_start|>assistant\n`) or markdown fences (```json ... ```).
+    // Strip those before any other parsing so Rig's typed prompt can deserialize.
+    if has_json_schema
+        && let Some(json) = extract_structured_json(raw_text)
+    {
+        return Ok(OneOrMany::one(AssistantContent::text(json)));
+    }
+
     if let Some(template_result) = template_result {
         match template_result.parse_response_oaicompat(raw_text, false) {
             Ok(parsed_json) => {
@@ -299,6 +311,142 @@ pub(crate) fn parse_completion_output(
     }
 
     Ok(OneOrMany::one(AssistantContent::text(raw_text.to_string())))
+}
+
+/// Extract a JSON object from grammar-constrained output that may be wrapped in
+/// markdown code fences, ChatML role tokens, or extra prose.
+///
+/// Scans for the first `{` and returns the substring up to the matching `}`,
+/// tracking brace depth and JSON string escaping so that braces inside strings
+/// don't confuse the balance. Returns `None` if no balanced object is found.
+pub(crate) fn extract_structured_json(raw_text: &str) -> Option<String> {
+    let bytes = raw_text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(raw_text[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_structured_json_plain_object() {
+        let out = extract_structured_json(r#"{"name":"Ada","age":36}"#).unwrap();
+        assert_eq!(out, r#"{"name":"Ada","age":36}"#);
+    }
+
+    #[test]
+    fn extract_structured_json_strips_markdown_fence() {
+        let raw = "```json\n{\n  \"name\": \"Ada\",\n  \"age\": 36\n}\n```";
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, "{\n  \"name\": \"Ada\",\n  \"age\": 36\n}");
+    }
+
+    #[test]
+    fn extract_structured_json_strips_plain_fence() {
+        let raw = "```\n{\"ok\": true}\n```";
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, r#"{"ok": true}"#);
+    }
+
+    #[test]
+    fn extract_structured_json_strips_chatml_role_prefix() {
+        let raw = "<|im_start|>assistant\n```json\n{\"value\": 1}\n```";
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, r#"{"value": 1}"#);
+    }
+
+    #[test]
+    fn extract_structured_json_strips_leading_prose() {
+        let raw = "Sure, here is the answer: {\"answer\": 42}";
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, r#"{"answer": 42}"#);
+    }
+
+    #[test]
+    fn extract_structured_json_handles_nested_objects() {
+        let raw = r#"```json
+{"person": {"name": "Ada", "skills": {"lang": "rust"}}, "age": 36}
+```"#;
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(
+            out,
+            r#"{"person": {"name": "Ada", "skills": {"lang": "rust"}}, "age": 36}"#
+        );
+    }
+
+    #[test]
+    fn extract_structured_json_ignores_braces_inside_strings() {
+        let raw = r#"{"text": "an { inside } string", "ok": true}"#;
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn extract_structured_json_handles_escaped_quotes_in_strings() {
+        let raw = r#"{"text": "she said \"hi\"", "brace": "}"}"#;
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn extract_structured_json_stops_at_first_balanced_object() {
+        let raw = r#"{"first": 1} and then {"second": 2}"#;
+        let out = extract_structured_json(raw).unwrap();
+        assert_eq!(out, r#"{"first": 1}"#);
+    }
+
+    #[test]
+    fn extract_structured_json_returns_none_when_unbalanced() {
+        assert!(extract_structured_json(r#"{"broken": "#).is_none());
+    }
+
+    #[test]
+    fn extract_structured_json_returns_none_when_no_object() {
+        assert!(extract_structured_json("just plain text, no json").is_none());
+        assert!(extract_structured_json("").is_none());
+    }
+
+    #[test]
+    fn extract_structured_json_handles_real_qwen_output() {
+        // Shape observed in practice: ChatML role token, markdown fence, indented body.
+        let raw = "<|im_start|>assistant\n```json\n{\n  \"age\": 36,\n  \"name\": \"Ada\",\n  \"occupation\": \"Software Engineer\"\n}\n```";
+        let out = extract_structured_json(raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["name"], "Ada");
+        assert_eq!(parsed["age"], 36);
+        assert_eq!(parsed["occupation"], "Software Engineer");
+    }
 }
 
 fn parse_oaicompat_message(

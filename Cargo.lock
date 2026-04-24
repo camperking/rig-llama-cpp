@@ -1388,6 +1388,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "rig-core",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

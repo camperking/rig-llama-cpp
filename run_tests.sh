@@ -94,6 +94,15 @@ MODEL_PATH="./$GEMMA_MODEL" \
 MODEL_PATH="./$GEMMA_MODEL" \
     cargo test gemma_tool_roundtrip -- --ignored --nocapture
 
+# ── Structured output (per-model) ────────────────────────────────────
+section "Qwen 3.5-2B — structured output"
+MODEL_PATH="./$QWEN_MODEL" \
+    cargo test qwen_structured_output -- --ignored --nocapture
+
+section "Gemma-4 E4B — structured output"
+MODEL_PATH="./$GEMMA_MODEL" \
+    cargo test gemma_structured_output -- --ignored --nocapture
+
 # ── KV cache quantization ────────────────────────────────────────────
 section "KV cache Q8_0 — Qwen 3.5-2B"
 MODEL_PATH="./$QWEN_MODEL" \
