@@ -300,12 +300,20 @@ fn document_text(document: &rig::message::Document) -> String {
 }
 
 fn tool_call_json(tool_call: &ToolCall) -> Value {
+    // Args may already be a JSON-encoded string (parser fallback for partial output).
+    // Re-encoding via `.to_string()` would double-quote it; an invalid string would
+    // crash the chat template renderer. Pass valid JSON through, swap the rest for "{}".
+    let arguments = match &tool_call.function.arguments {
+        Value::String(s) if serde_json::from_str::<Value>(s).is_ok() => s.clone(),
+        Value::String(_) => "{}".to_string(),
+        other => other.to_string(),
+    };
     json!({
         "id": tool_call.id,
         "type": "function",
         "function": {
             "name": tool_call.function.name,
-            "arguments": tool_call.function.arguments.to_string(),
+            "arguments": arguments,
         }
     })
 }
