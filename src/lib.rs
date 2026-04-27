@@ -90,3 +90,45 @@ fn env_flag_enabled(name: &str) -> bool {
 fn llama_logs_enabled() -> bool {
     env_flag_enabled("RIG_LLAMA_CPP_LOGS")
 }
+
+/// Process-wide [`LlamaBackend`] initialised on first use and shared by every
+/// worker (chat + embedding). The underlying llama.cpp backend is a global
+/// singleton — calling `LlamaBackend::init()` twice in the same process
+/// returns `BackendAlreadyInitialized`. Routing all callers through this
+/// helper means a chat client and an embedding client can coexist without
+/// racing on the C-side init flag.
+///
+/// Returns `Ok(&'static LlamaBackend)` once the backend is up; subsequent
+/// calls are cheap (single `OnceLock::get`). On platforms where init can
+/// fail (e.g. no Vulkan device) the error is sticky for the lifetime of
+/// the process — there's no recovering anyway.
+pub(crate) fn shared_backend()
+-> Result<&'static llama_cpp_2::llama_backend::LlamaBackend, String> {
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use std::sync::{Mutex, OnceLock};
+
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    // Serialise concurrent first-time initialisations. The C-side init flag
+    // is process-global so multiple threads racing on `LlamaBackend::init`
+    // will produce `BackendAlreadyInitialized` for the loser even though
+    // they all want the same handle.
+    let _guard = INIT_LOCK.lock().map_err(|e| e.to_string())?;
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+
+    let mut backend =
+        LlamaBackend::init().map_err(|e| format!("Backend init failed: {e}"))?;
+    if !llama_logs_enabled() {
+        backend.void_logs();
+        #[cfg(feature = "mtmd")]
+        llama_cpp_2::mtmd::void_mtmd_logs();
+    }
+    let _ = BACKEND.set(backend);
+    Ok(BACKEND.get().expect("backend just set"))
+}

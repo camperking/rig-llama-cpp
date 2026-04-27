@@ -172,34 +172,17 @@ fn embedding_worker(
     rx: &mut mpsc::UnboundedReceiver<EmbeddingCommand>,
 ) {
     use llama_cpp_2::list_llama_ggml_backend_devices;
-    use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::model::LlamaModel as LlamaCppModel;
     use llama_cpp_2::model::params::LlamaModelParams;
 
-    let mut backend = {
-        let mut attempts = 0;
-        loop {
-            match LlamaBackend::init() {
-                Ok(b) => break b,
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= 10 {
-                        let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
-                        return;
-                    }
-                    // Previous backend is being torn down — wait briefly
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
+    let backend = match crate::shared_backend() {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = init_tx.send(Err(e));
+            return;
         }
     };
     let logs_enabled = crate::llama_logs_enabled();
-
-    if !logs_enabled {
-        backend.void_logs();
-        #[cfg(feature = "mtmd")]
-        llama_cpp_2::mtmd::void_mtmd_logs();
-    }
 
     let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
@@ -230,7 +213,7 @@ fn embedding_worker(
         eprintln!("Loading embedding model from {model_path}...");
     }
 
-    let model = match LlamaCppModel::load_from_file(&backend, model_path, &model_params) {
+    let model = match LlamaCppModel::load_from_file(backend, model_path, &model_params) {
         Ok(m) => m,
         Err(e) => {
             let _ = init_tx.send(Err(format!("Model load failed: {e}")));
@@ -251,7 +234,7 @@ fn embedding_worker(
             EmbeddingCommand::Shutdown => break,
         };
 
-        let result = run_embedding(&backend, &model, n_ctx, &req.texts);
+        let result = run_embedding(backend, &model, n_ctx, &req.texts);
         let _ = req.response_tx.send(result);
     }
 }
@@ -266,8 +249,16 @@ fn run_embedding(
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::AddBos;
 
+    // Encoder-only embedding models require `n_ubatch >= n_tokens` for
+    // every single sequence in the batch (llama.cpp asserts on this).
+    // The default `n_ubatch` is 512, which is smaller than a typical
+    // chunk's token count, so we widen both the batch and micro-batch to
+    // match `n_ctx`. This lets any chunk that fits the context window also
+    // fit in one micro-batch step.
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_n_batch(n_ctx)
+        .with_n_ubatch(n_ctx)
         .with_n_seq_max((texts.len() as u32).max(1))
         .with_embeddings(true);
 

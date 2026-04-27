@@ -147,25 +147,17 @@ pub(crate) fn inference_worker(
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
-    use llama_cpp_2::llama_backend::LlamaBackend;
-
-    let mut backend = match LlamaBackend::init() {
+    let backend = match crate::shared_backend() {
         Ok(b) => b,
         Err(e) => {
-            let _ = init_tx.send(Err(format!("Backend init failed: {e}")));
+            let _ = init_tx.send(Err(e));
             return;
         }
     };
     let logs_enabled = crate::llama_logs_enabled();
 
-    if !logs_enabled {
-        backend.void_logs();
-        #[cfg(feature = "mtmd")]
-        llama_cpp_2::mtmd::void_mtmd_logs();
-    }
-
     let mut wm = match fit_and_load_model(
-        &backend,
+        backend,
         model_path,
         mmproj_path,
         n_ctx,
@@ -200,7 +192,7 @@ pub(crate) fn inference_worker(
                 match response_channel {
                     ResponseChannel::Completion(tx) => {
                         let result = run_inference(
-                            &backend,
+                            backend,
                             &wm.model,
                             wm.n_ctx,
                             &wm.kv_cache,
@@ -212,7 +204,7 @@ pub(crate) fn inference_worker(
                     }
                     ResponseChannel::Streaming(stream_tx) => {
                         let result = run_inference(
-                            &backend,
+                            backend,
                             &wm.model,
                             wm.n_ctx,
                             &wm.kv_cache,
@@ -241,7 +233,7 @@ pub(crate) fn inference_worker(
                 drop(wm);
 
                 let result = fit_and_load_model(
-                    &backend,
+                    backend,
                     &reload.model_path,
                     reload.mmproj_path.as_deref(),
                     reload.n_ctx,
