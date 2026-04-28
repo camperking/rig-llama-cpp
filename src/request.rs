@@ -1,8 +1,35 @@
 use rig::completion::CompletionRequest;
 use rig::message::{AssistantContent, Message, ToolCall, UserContent};
+use rig::one_or_many::OneOrMany;
 use serde_json::{Value, json};
 
 use crate::types::PreparedRequest;
+
+/// Normalize a tool result's content list. rig-core 0.35.0's streaming agent
+/// loop stores the raw tool-output string as plain `ToolResultContent::Text`
+/// in the chat history it sends to the next provider call (its non-streaming
+/// counterpart calls `ToolResultContent::from_tool_output` to parse image
+/// JSON into `Image` variants). This re-parses Text parts here so image
+/// content emitted by tools surfaces as `ToolResultContent::Image` regardless
+/// of which agent path produced the history. No-op for plain-text outputs:
+/// `from_tool_output` falls back to a single Text part on parse failure.
+fn normalized_tool_parts(
+    content: &OneOrMany<rig::message::ToolResultContent>,
+) -> Vec<rig::message::ToolResultContent> {
+    let mut out = Vec::new();
+    for part in content.iter() {
+        match part {
+            rig::message::ToolResultContent::Text(t) => {
+                let parsed = rig::message::ToolResultContent::from_tool_output(t.text.clone());
+                for p in parsed.into_iter() {
+                    out.push(p);
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
 
 pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, String> {
     let mut messages = Vec::new();
@@ -83,11 +110,30 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
         for msg in request.chat_history.iter() {
             if let Message::User { content } = msg {
                 for item in content.iter() {
-                    if let UserContent::Image(image) = item {
-                        match extract_image_bytes(image) {
+                    match item {
+                        UserContent::Image(image) => match extract_image_bytes(image) {
                             Ok(bytes) => imgs.push(bytes),
                             Err(e) => return Err(format!("Image extraction failed: {e}")),
+                        },
+                        UserContent::ToolResult(tool_result) => {
+                            // Tool results can carry image content (e.g. a `read_file`
+                            // tool that reads a `.png`). Bitmap ordering must match the
+                            // order media markers appear in `append_message_json`, so we
+                            // walk the normalized parts here in the same iteration order.
+                            for part in normalized_tool_parts(&tool_result.content) {
+                                if let rig::message::ToolResultContent::Image(image) = part {
+                                    match extract_image_bytes(&image) {
+                                        Ok(bytes) => imgs.push(bytes),
+                                        Err(e) => {
+                                            return Err(format!(
+                                                "Tool-result image extraction failed: {e}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 }
             }
@@ -223,7 +269,26 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                     }));
                 }
 
+                #[cfg(feature = "mtmd")]
+                let mut pending_tool_image_count: usize = 0;
+
                 for tool_result in tool_results {
+                    #[cfg(feature = "mtmd")]
+                    let normalized = normalized_tool_parts(&tool_result.content);
+
+                    #[cfg(feature = "mtmd")]
+                    let content = normalized
+                        .iter()
+                        .filter_map(|part| match part {
+                            rig::message::ToolResultContent::Text(text) => {
+                                Some(text.text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    #[cfg(not(feature = "mtmd"))]
                     let content = tool_result
                         .content
                         .iter()
@@ -236,10 +301,62 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                         .collect::<Vec<_>>()
                         .join("\n");
 
+                    #[cfg(feature = "mtmd")]
+                    let image_count = normalized
+                        .iter()
+                        .filter(|part| matches!(part, rig::message::ToolResultContent::Image(_)))
+                        .count();
+
+                    #[cfg(feature = "mtmd")]
+                    let final_content = if image_count > 0 && content.is_empty() {
+                        // OAI-compat tool messages must be a non-empty string;
+                        // an empty content for `role: "tool"` makes some chat
+                        // templates emit a malformed turn. Drop a brief
+                        // placeholder so the model knows the call returned and
+                        // expects the image to follow.
+                        format!("[returned {image_count} image(s); see next message]")
+                    } else {
+                        content
+                    };
+                    #[cfg(not(feature = "mtmd"))]
+                    let final_content = content;
+
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_result.call_id.as_deref().unwrap_or(&tool_result.id),
-                        "content": content,
+                        "content": final_content,
+                    }));
+
+                    #[cfg(feature = "mtmd")]
+                    {
+                        pending_tool_image_count += image_count;
+                    }
+                }
+
+                // Tool-result images can't ride along with `role: "tool"` content
+                // in llama.cpp's OAI-compat chat template (multimodal markers are
+                // only honored in user messages). Emit a synthetic user message
+                // carrying one media_marker per tool-result image so the bitmaps
+                // collected in `prepare_request` line up positionally with the
+                // markers in the rendered prompt.
+                #[cfg(feature = "mtmd")]
+                if pending_tool_image_count > 0 {
+                    let mut content_parts: Vec<Value> = Vec::with_capacity(
+                        pending_tool_image_count + 1,
+                    );
+                    content_parts.push(json!({
+                        "type": "text",
+                        "text": "Image(s) returned by the tool call above:",
+                    }));
+                    for _ in 0..pending_tool_image_count {
+                        content_parts.push(json!({
+                            "type": "media_marker",
+                            "text": llama_cpp_2::mtmd::mtmd_default_marker(),
+                        }));
+                    }
+                    messages.push(json!({
+                        "role": "user",
+                        "content": content_parts,
                     }));
                 }
             }
