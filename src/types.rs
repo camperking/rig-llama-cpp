@@ -27,6 +27,10 @@ pub struct StreamChunk {
     /// Number of completion tokens (only set on the final chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
+    /// Number of prompt tokens that were served from the persistent KV-cache prefix
+    /// (only set on the final chunk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
 }
 
 impl GetTokenUsage for StreamChunk {
@@ -36,7 +40,7 @@ impl GetTokenUsage for StreamChunk {
             input_tokens: input,
             output_tokens: output,
             total_tokens: input + output,
-            cached_input_tokens: 0,
+            cached_input_tokens: self.cached_input_tokens.unwrap_or(0),
             cache_creation_input_tokens: 0,
         })
     }
@@ -86,6 +90,9 @@ pub(crate) struct InferenceResult {
     pub choice: OneOrMany<AssistantContent>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Tokens of the prompt that were already present in the persistent KV cache
+    /// (i.e. the longest common prefix shared with the previous request).
+    pub cached_input_tokens: u64,
 }
 
 pub(crate) struct PreparedRequest {

@@ -138,6 +138,101 @@ fn fit_and_load_model(
     })
 }
 
+/// Persistent inference state carried across requests for prefix-cache reuse.
+///
+/// We hold one `LlamaContext` for the worker's lifetime instead of recreating it
+/// per request, plus the tokens currently decoded into KV-cache slot 0. On each
+/// new prompt we compute the longest common prefix against `last_tokens` and
+/// only decode the suffix — the matching prefix already lives in the cache.
+///
+/// The lifetime `'m` borrows from the active `WorkerModel::model`. The struct is
+/// only ever constructed and dropped inside `handle_until_reload`, so it never
+/// outlives the model reference it borrows from.
+struct PersistentCtx<'m> {
+    ctx: llama_cpp_2::context::LlamaContext<'m>,
+    last_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+}
+
+enum LoopOutcome {
+    Reload(crate::types::ReloadRequest),
+    Shutdown,
+}
+
+/// Inner request loop that owns the persistent context.
+///
+/// Returns when the channel closes, a reload is requested, or shutdown is requested.
+/// On Reload the caller drops `wm` and reloads the model — the persistent context
+/// (which borrows `&wm.model`) is dropped automatically when this function returns.
+fn handle_until_reload<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    wm: &'m WorkerModel,
+    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
+) -> LoopOutcome {
+    let mut persistent: Option<PersistentCtx<'m>> = None;
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            InferenceCommand::Request(req) => {
+                let crate::types::InferenceRequest {
+                    params,
+                    response_channel,
+                } = req;
+
+                #[cfg(feature = "mtmd")]
+                let mtmd_ref = wm.mtmd_ctx.as_ref();
+                #[cfg(not(feature = "mtmd"))]
+                let mtmd_ref: Option<&()> = None;
+
+                match response_channel {
+                    ResponseChannel::Completion(tx) => {
+                        let result = run_inference(
+                            backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &wm.kv_cache,
+                            &mut persistent,
+                            &params,
+                            None,
+                            mtmd_ref,
+                        );
+                        let _ = tx.send(result);
+                    }
+                    ResponseChannel::Streaming(stream_tx) => {
+                        let result = run_inference(
+                            backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &wm.kv_cache,
+                            &mut persistent,
+                            &params,
+                            Some(&stream_tx),
+                            mtmd_ref,
+                        );
+                        match result {
+                            Ok(result) => {
+                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
+                                    StreamChunk {
+                                        text: result.text,
+                                        prompt_tokens: Some(result.prompt_tokens),
+                                        completion_tokens: Some(result.completion_tokens),
+                                        cached_input_tokens: Some(result.cached_input_tokens),
+                                    },
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
+                            }
+                        }
+                    }
+                }
+            }
+            InferenceCommand::Reload(reload) => return LoopOutcome::Reload(reload),
+            InferenceCommand::Shutdown => return LoopOutcome::Shutdown,
+        }
+    }
+    LoopOutcome::Shutdown
+}
+
 pub(crate) fn inference_worker(
     model_path: &str,
     mmproj_path: Option<&str>,
@@ -175,61 +270,12 @@ pub(crate) fn inference_worker(
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
-    // Process inference requests
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            InferenceCommand::Request(req) => {
-                let crate::types::InferenceRequest {
-                    params,
-                    response_channel,
-                } = req;
-
-                #[cfg(feature = "mtmd")]
-                let mtmd_ref = wm.mtmd_ctx.as_ref();
-                #[cfg(not(feature = "mtmd"))]
-                let mtmd_ref: Option<&()> = None;
-
-                match response_channel {
-                    ResponseChannel::Completion(tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            &params,
-                            None,
-                            mtmd_ref,
-                        );
-                        let _ = tx.send(result);
-                    }
-                    ResponseChannel::Streaming(stream_tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            &params,
-                            Some(&stream_tx),
-                            mtmd_ref,
-                        );
-                        match result {
-                            Ok(result) => {
-                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
-                                    StreamChunk {
-                                        text: result.text,
-                                        prompt_tokens: Some(result.prompt_tokens),
-                                        completion_tokens: Some(result.completion_tokens),
-                                    },
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
-                            }
-                        }
-                    }
-                }
-            }
-            InferenceCommand::Reload(reload) => {
+    loop {
+        match handle_until_reload(backend, &wm, rx) {
+            LoopOutcome::Reload(reload) => {
+                // The persistent context (held inside handle_until_reload) has
+                // already been dropped by the time we get here, so it is safe
+                // to drop and replace `wm`.
                 drop(wm);
 
                 let result = fit_and_load_model(
@@ -253,13 +299,233 @@ pub(crate) fn inference_worker(
                     }
                 }
             }
-            InferenceCommand::Shutdown => break,
+            LoopOutcome::Shutdown => break,
         }
     }
 }
 
 #[cfg(feature = "mtmd")]
-fn run_inference(
+fn run_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(
+        backend, model, n_ctx, kv_cache, persistent, req, stream_tx, mtmd_ctx,
+    )
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    _mtmd_ctx: Option<&()>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference_inner<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+) -> Result<InferenceResult, String> {
+    run_text_inference(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+}
+
+#[cfg(feature = "mtmd")]
+fn run_inference_inner<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    let has_images = !req.prepared_request.images.is_empty();
+
+    if has_images && mtmd_ctx.is_some() {
+        // Image turns use a fresh, throwaway context. The persistent text-only
+        // KV cache is left untouched: when the next text turn arrives, its
+        // history will include this turn's text representation, which the LCP
+        // path will simply decode as new suffix.
+        run_image_inference(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
+    } else {
+        run_text_inference(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+    }
+}
+
+/// Text-only inference with persistent-context + prefix-cache reuse.
+///
+/// On each call we tokenize the new prompt, find the longest common prefix with
+/// the tokens currently committed in the KV cache, trim everything after that
+/// prefix, and decode only the suffix. On any decode/sample error we invalidate
+/// the persistent slot so the next request rebuilds from scratch.
+fn run_text_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::model::AddBos;
+
+    let prompt_build = build_prompt(model, &req.prepared_request)?;
+    let prompt = prompt_build.prompt.as_str();
+
+    let new_tokens = model
+        .str_to_token(prompt, AddBos::Always)
+        .map_err(|e| format!("Tokenization failed: {e}"))?;
+    let prompt_len = new_tokens.len();
+
+    if prompt_len == 0 {
+        return Err("Empty prompt after tokenization".to_string());
+    }
+    if prompt_len > n_ctx as usize {
+        return Err(format!(
+            "Prompt {prompt_len} tokens exceeds n_ctx {n_ctx}"
+        ));
+    }
+
+    if persistent.is_none() {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_type_k(kv_cache.type_k)
+            .with_type_v(kv_cache.type_v);
+        let ctx = model
+            .new_context(backend, ctx_params)
+            .map_err(|e| format!("Context creation failed: {e}"))?;
+        *persistent = Some(PersistentCtx {
+            ctx,
+            last_tokens: Vec::new(),
+        });
+    }
+
+    let cached = {
+        let p = persistent.as_ref().unwrap();
+        p.last_tokens
+            .iter()
+            .zip(new_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+
+    let result = run_text_inference_locked(
+        persistent.as_mut().unwrap(),
+        new_tokens,
+        cached,
+        prompt_len,
+        &prompt_build,
+        req,
+        stream_tx,
+        model,
+    );
+
+    if result.is_err() {
+        // Decode/sample failed mid-flight: KV state is now ambiguous. Drop the
+        // whole persistent slot so the next request rebuilds cleanly.
+        *persistent = None;
+    }
+    result
+}
+
+fn run_text_inference_locked(
+    p: &mut PersistentCtx<'_>,
+    new_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    cached: usize,
+    prompt_len: usize,
+    prompt_build: &PromptBuildResult,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    model: &llama_cpp_2::model::LlamaModel,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::llama_batch::LlamaBatch;
+
+    let ctx = &mut p.ctx;
+    let last = &mut p.last_tokens;
+
+    if cached < last.len() {
+        ctx.clear_kv_cache_seq(Some(0), Some(cached as u32), None)
+            .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+    }
+
+    let prompt_batch_limit = ctx.n_batch().max(1) as usize;
+    let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
+
+    if cached < prompt_len {
+        // Decode the new suffix only.
+        let suffix = &new_tokens[cached..];
+        for (chunk_index, chunk) in suffix.chunks(prompt_batch_limit).enumerate() {
+            batch.clear();
+            for (offset, token) in chunk.iter().copied().enumerate() {
+                let abs = cached + chunk_index * prompt_batch_limit + offset;
+                let is_last_prompt_token = abs + 1 == prompt_len;
+                batch
+                    .add(token, abs as i32, &[0], is_last_prompt_token)
+                    .map_err(|e| format!("Batch add failed: {e}"))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| format!("Prompt decode failed: {e}"))?;
+        }
+    } else {
+        // Whole prompt already cached. Roll back the last position by one and
+        // re-decode it so the sampler has a fresh `logits=true` slot to read.
+        ctx.clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
+            .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+        batch.clear();
+        batch
+            .add(
+                new_tokens[prompt_len - 1],
+                (prompt_len - 1) as i32,
+                &[0],
+                true,
+            )
+            .map_err(|e| format!("Batch add failed: {e}"))?;
+        ctx.decode(&mut batch)
+            .map_err(|e| format!("Prompt decode failed: {e}"))?;
+    }
+
+    // Commit the prompt portion to last_tokens before sampling so that an
+    // abort mid-generation still leaves the cache state consistent with what
+    // we'll claim on the next turn.
+    *last = new_tokens;
+    let prompt_tokens = prompt_len as u64;
+    let cached_tokens = cached as u64;
+
+    sample_tokens(
+        model,
+        ctx,
+        &mut batch,
+        prompt_build,
+        req,
+        stream_tx,
+        prompt_tokens,
+        cached_tokens,
+        last,
+    )
+}
+
+#[cfg(feature = "mtmd")]
+fn run_image_inference(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
@@ -268,72 +534,55 @@ fn run_inference(
     stream_tx: Option<&StreamSender>,
     mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
 ) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    _mtmd_ctx: Option<&()>,
-) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx)
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference_inner(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-) -> Result<InferenceResult, String> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
 
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_type_k(kv_cache.type_k)
         .with_type_v(kv_cache.type_v);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| format!("Context creation failed: {e}"))?;
 
-    let tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| format!("Tokenization failed: {e}"))?;
-    let prompt_tokens = tokens.len() as u64;
+    let mtmd = mtmd_ctx.expect("run_image_inference called without mtmd context");
 
-    let prompt_len = tokens.len();
+    let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
+        .prepared_request
+        .images
+        .iter()
+        .map(|bytes| {
+            llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, bytes)
+                .map_err(|e| format!("Failed to create bitmap from image data: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let bitmap_refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
+
+    let text_input = llama_cpp_2::mtmd::MtmdInputText {
+        text: prompt.to_string(),
+        add_special: true,
+        parse_special: true,
+    };
+
+    let chunks = mtmd
+        .tokenize(text_input, &bitmap_refs)
+        .map_err(|e| format!("Multimodal tokenization failed: {e}"))?;
+
+    let prompt_tokens = chunks.total_tokens() as u64;
+    let n_batch = ctx.n_batch() as i32;
+
+    let n_past = chunks
+        .eval_chunks(mtmd, &ctx, 0, 0, n_batch, true)
+        .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
+
     let prompt_batch_limit = ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
 
-    for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
-        batch.clear();
-
-        for (offset, token) in chunk.iter().copied().enumerate() {
-            let position = (chunk_index * prompt_batch_limit + offset) as i32;
-            let is_last_prompt_token = chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
-
-            batch
-                .add(token, position, &[0], is_last_prompt_token)
-                .map_err(|e| format!("Batch add failed: {e}"))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| format!("Prompt decode failed: {e}"))?;
-    }
-
-    sample_tokens(
+    sample_tokens_from_pos(
         model,
         &mut ctx,
         &mut batch,
@@ -341,124 +590,8 @@ fn run_inference_inner(
         req,
         stream_tx,
         prompt_tokens,
+        n_past as i32,
     )
-}
-
-#[cfg(feature = "mtmd")]
-fn run_inference_inner(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
-) -> Result<InferenceResult, String> {
-    use llama_cpp_2::context::params::LlamaContextParams;
-    use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
-
-    let prompt_build = build_prompt(model, &req.prepared_request)?;
-    let prompt = prompt_build.prompt.as_str();
-
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
-        .with_type_k(kv_cache.type_k)
-        .with_type_v(kv_cache.type_v);
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .map_err(|e| format!("Context creation failed: {e}"))?;
-
-    let has_images = !req.prepared_request.images.is_empty();
-
-    if has_images && mtmd_ctx.is_some() {
-        let mtmd = mtmd_ctx.unwrap();
-
-        // Create bitmaps from raw image bytes
-        let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
-            .prepared_request
-            .images
-            .iter()
-            .map(|bytes| {
-                llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, bytes)
-                    .map_err(|e| format!("Failed to create bitmap from image data: {e}"))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let bitmap_refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
-
-        let text_input = llama_cpp_2::mtmd::MtmdInputText {
-            text: prompt.to_string(),
-            add_special: true,
-            parse_special: true,
-        };
-
-        let chunks = mtmd
-            .tokenize(text_input, &bitmap_refs)
-            .map_err(|e| format!("Multimodal tokenization failed: {e}"))?;
-
-        let prompt_tokens = chunks.total_tokens() as u64;
-        let n_batch = ctx.n_batch() as i32;
-
-        let n_past = chunks
-            .eval_chunks(mtmd, &ctx, 0, 0, n_batch, true)
-            .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
-
-        // Set up batch for sampling — we need a batch positioned at n_past
-        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
-        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
-
-        // After eval_chunks, the context is ready for sampling.
-        // We need to set n_cur to n_past for the sampling loop.
-        // The batch from eval_chunks already set logits_last=true, so we can sample directly.
-        sample_tokens_from_pos(
-            model,
-            &mut ctx,
-            &mut batch,
-            &prompt_build,
-            req,
-            stream_tx,
-            prompt_tokens,
-            n_past as i32,
-        )
-    } else {
-        // Standard text-only path
-        let tokens = model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| format!("Tokenization failed: {e}"))?;
-        let prompt_tokens = tokens.len() as u64;
-
-        let prompt_len = tokens.len();
-        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
-        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
-
-        for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
-            batch.clear();
-
-            for (offset, token) in chunk.iter().copied().enumerate() {
-                let position = (chunk_index * prompt_batch_limit + offset) as i32;
-                let is_last_prompt_token =
-                    chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
-
-                batch
-                    .add(token, position, &[0], is_last_prompt_token)
-                    .map_err(|e| format!("Batch add failed: {e}"))?;
-            }
-
-            ctx.decode(&mut batch)
-                .map_err(|e| format!("Prompt decode failed: {e}"))?;
-        }
-
-        sample_tokens(
-            model,
-            &mut ctx,
-            &mut batch,
-            &prompt_build,
-            req,
-            stream_tx,
-            prompt_tokens,
-        )
-    }
 }
 
 /// Build a set of token IDs that should be decoded with `special = true`.
@@ -646,6 +779,9 @@ fn sample_tokens_from_pos(
     prompt_tokens: u64,
     n_past: i32,
 ) -> Result<InferenceResult, String> {
+    // Image-path inference uses a throwaway context, so nothing was served
+    // from a persistent prefix cache.
+    let cached_input_tokens = 0u64;
     let SamplerChain {
         mut sampler,
         has_grammar,
@@ -772,6 +908,7 @@ fn sample_tokens_from_pos(
         choice,
         prompt_tokens,
         completion_tokens,
+        cached_input_tokens,
     })
 }
 
@@ -783,6 +920,8 @@ fn sample_tokens(
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
+    cached_input_tokens: u64,
+    last_tokens: &mut Vec<llama_cpp_2::token::LlamaToken>,
 ) -> Result<InferenceResult, String> {
     let SamplerChain {
         mut sampler,
@@ -864,6 +1003,9 @@ fn sample_tokens(
             .map_err(|e| format!("Batch add failed: {e}"))?;
         ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
+        // Track tokens that are now committed to the KV cache so the next
+        // request can detect the longest common prefix correctly.
+        last_tokens.push(token);
         n_cur += 1;
     }
 
@@ -905,6 +1047,7 @@ fn sample_tokens(
         choice,
         prompt_tokens,
         completion_tokens,
+        cached_input_tokens,
     })
 }
 

@@ -243,7 +243,7 @@ impl CompletionModel for Model {
                 input_tokens: result.prompt_tokens,
                 output_tokens: result.completion_tokens,
                 total_tokens: result.prompt_tokens + result.completion_tokens,
-                cached_input_tokens: 0,
+                cached_input_tokens: result.cached_input_tokens,
                 cache_creation_input_tokens: 0,
             },
             raw_response: RawResponse { text: result.text },
