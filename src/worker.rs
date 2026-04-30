@@ -151,6 +151,14 @@ fn fit_and_load_model(
 struct PersistentCtx<'m> {
     ctx: llama_cpp_2::context::LlamaContext<'m>,
     last_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Set to true once we've observed that this model's memory implementation
+    /// rejects partial cache trims (`clear_kv_cache_seq` returning `Ok(false)`).
+    /// Recurrent/hybrid models like Mamba/RWKV/Jamba can't roll back the
+    /// recurrent state to an arbitrary position. When this flag is set we stop
+    /// attempting partial trims and instead fully clear + redecode whenever a
+    /// rollback would otherwise be needed. Extension-mode reuse
+    /// (`cached == last_tokens.len()`) still works.
+    trim_unsupported: bool,
 }
 
 enum LoopOutcome {
@@ -419,18 +427,19 @@ fn run_text_inference<'m>(
     };
 
     // Phase 1: prompt decode (with prefix-cache reuse). This phase is safe to
-    // retry on failure because no output has been streamed yet.
-    let mut batch = match prepare_prompt_decode(
+    // retry on failure because no output has been streamed yet. The helper
+    // gracefully handles trim-unsupported memories (recurrent/hybrid) by
+    // fully clearing the cache instead of partial trimming.
+    let (mut batch, effective_cached) = match prepare_prompt_decode(
         persistent.as_mut().unwrap(),
         &new_tokens,
         cached,
         prompt_len,
     ) {
-        Ok(b) => b,
+        Ok(out) => out,
         Err(e) if cached > 0 => {
-            // Prefix-cache reuse failed. Drop persistent, rebuild fresh, and
-            // retry with cached=0. We can do this safely because the streaming
-            // consumer hasn't received any tokens yet.
+            // Some other phase-1 failure mode. Drop persistent, rebuild fresh,
+            // and retry from scratch. Safe because no output has streamed yet.
             eprintln!(
                 "[rig-llama-cpp] prefix-cache decode failed (cached={cached}, prompt_len={prompt_len}): {e}. \
                  Falling back to fresh-context decode."
@@ -443,7 +452,7 @@ fn run_text_inference<'m>(
                 0,
                 prompt_len,
             ) {
-                Ok(b) => b,
+                Ok(out) => out,
                 Err(e) => {
                     *persistent = None;
                     return Err(e);
@@ -462,7 +471,7 @@ fn run_text_inference<'m>(
     let p = persistent.as_mut().unwrap();
     p.last_tokens = new_tokens;
     let prompt_tokens = prompt_len as u64;
-    let cached_tokens = cached as u64;
+    let cached_tokens = effective_cached as u64;
 
     let result = sample_tokens(
         model,
@@ -504,52 +513,80 @@ fn ensure_persistent_ctx<'m>(
     *persistent = Some(PersistentCtx {
         ctx,
         last_tokens: Vec::new(),
+        trim_unsupported: false,
     });
     Ok(())
 }
 
 /// Decode the prompt suffix into the persistent context's KV cache and return
-/// a batch ready for sampling. This is "phase 1" — safe to retry on failure
-/// because no output has been streamed to the consumer yet.
+/// a batch ready for sampling, plus the count of tokens that were actually
+/// served from the cache (which may be less than the LCP if a rollback wasn't
+/// possible). This is "phase 1" — safe to retry on failure because no output
+/// has been streamed to the consumer yet.
+///
+/// Recurrent and hybrid memory implementations (Mamba/RWKV/Jamba) don't
+/// support partial KV-cache trims; for those we fully clear the cache and
+/// re-decode the whole prompt instead of failing the request.
 fn prepare_prompt_decode<'b>(
     p: &mut PersistentCtx<'_>,
     new_tokens: &[llama_cpp_2::token::LlamaToken],
     cached: usize,
     prompt_len: usize,
-) -> Result<llama_cpp_2::llama_batch::LlamaBatch<'b>, String> {
+) -> Result<(llama_cpp_2::llama_batch::LlamaBatch<'b>, usize), String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
     let ctx = &mut p.ctx;
-    let last = &p.last_tokens;
+    let last = &mut p.last_tokens;
 
     if crate::llama_logs_enabled() {
         eprintln!(
-            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached}",
-            last.len()
+            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached} trim_unsupported={}",
+            last.len(),
+            p.trim_unsupported
         );
     }
 
+    let mut effective_cached = cached;
+
     if cached < last.len() {
-        let removed = ctx
-            .clear_kv_cache_seq(Some(0), Some(cached as u32), None)
-            .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
-        if !removed {
-            return Err(format!(
-                "KV cache trim returned false (partial removal failed) at pos {cached}",
-            ));
+        // Need to roll back the cache to position `cached`.
+        if p.trim_unsupported {
+            // Already known: this model can't roll back. Fully clear and start
+            // over from position 0.
+            ctx.clear_kv_cache();
+            last.clear();
+            effective_cached = 0;
+        } else {
+            let removed = ctx
+                .clear_kv_cache_seq(Some(0), Some(cached as u32), None)
+                .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+            if !removed {
+                // First time we've seen this model reject a partial trim.
+                // Mark it and fall back to a full clear so the rest of this
+                // request still goes through and future requests skip the
+                // trim attempt entirely.
+                eprintln!(
+                    "[rig-llama-cpp] partial KV-cache trim not supported by this model \
+                     (likely recurrent/hybrid). Disabling prefix-cache rollback for this session."
+                );
+                p.trim_unsupported = true;
+                ctx.clear_kv_cache();
+                last.clear();
+                effective_cached = 0;
+            }
         }
     }
 
     let prompt_batch_limit = ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
 
-    if cached < prompt_len {
+    if effective_cached < prompt_len {
         // Decode the new suffix only.
-        let suffix = &new_tokens[cached..];
+        let suffix = &new_tokens[effective_cached..];
         for (chunk_index, chunk) in suffix.chunks(prompt_batch_limit).enumerate() {
             batch.clear();
             for (offset, token) in chunk.iter().copied().enumerate() {
-                let abs = cached + chunk_index * prompt_batch_limit + offset;
+                let abs = effective_cached + chunk_index * prompt_batch_limit + offset;
                 let is_last_prompt_token = abs + 1 == prompt_len;
                 batch
                     .add(token, abs as i32, &[0], is_last_prompt_token)
@@ -568,6 +605,8 @@ fn prepare_prompt_decode<'b>(
     } else {
         // Whole prompt already cached. Roll back the last position by one and
         // re-decode it so the sampler has a fresh `logits=true` slot to read.
+        // This is only reachable when trim is supported (otherwise we'd have
+        // taken the full-clear path above and reset effective_cached to 0).
         let removed = ctx
             .clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
             .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
@@ -590,7 +629,7 @@ fn prepare_prompt_decode<'b>(
             .map_err(|e| format!("Prompt decode failed: {e}"))?;
     }
 
-    Ok(batch)
+    Ok((batch, effective_cached))
 }
 
 #[cfg(feature = "mtmd")]
