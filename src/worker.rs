@@ -375,8 +375,10 @@ fn run_inference_inner<'m>(
 ///
 /// On each call we tokenize the new prompt, find the longest common prefix with
 /// the tokens currently committed in the KV cache, trim everything after that
-/// prefix, and decode only the suffix. On any decode/sample error we invalidate
-/// the persistent slot so the next request rebuilds from scratch.
+/// prefix, and decode only the suffix. If prefix-cache reuse fails (which can
+/// happen e.g. on memory implementations that don't support arbitrary partial
+/// trims), we invalidate the persistent slot and retry once with a fresh
+/// context — so the user's request still succeeds at the cost of a full decode.
 fn run_text_inference<'m>(
     backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
     model: &'m llama_cpp_2::model::LlamaModel,
@@ -386,7 +388,6 @@ fn run_text_inference<'m>(
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
-    use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::model::AddBos;
 
     let prompt_build = build_prompt(model, &req.prepared_request)?;
@@ -406,19 +407,7 @@ fn run_text_inference<'m>(
         ));
     }
 
-    if persistent.is_none() {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_type_k(kv_cache.type_k)
-            .with_type_v(kv_cache.type_v);
-        let ctx = model
-            .new_context(backend, ctx_params)
-            .map_err(|e| format!("Context creation failed: {e}"))?;
-        *persistent = Some(PersistentCtx {
-            ctx,
-            last_tokens: Vec::new(),
-        });
-    }
+    ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
 
     let cached = {
         let p = persistent.as_ref().unwrap();
@@ -429,43 +418,126 @@ fn run_text_inference<'m>(
             .count()
     };
 
-    let result = run_text_inference_locked(
+    // Phase 1: prompt decode (with prefix-cache reuse). This phase is safe to
+    // retry on failure because no output has been streamed yet.
+    let mut batch = match prepare_prompt_decode(
         persistent.as_mut().unwrap(),
-        new_tokens,
+        &new_tokens,
         cached,
         prompt_len,
+    ) {
+        Ok(b) => b,
+        Err(e) if cached > 0 => {
+            // Prefix-cache reuse failed. Drop persistent, rebuild fresh, and
+            // retry with cached=0. We can do this safely because the streaming
+            // consumer hasn't received any tokens yet.
+            eprintln!(
+                "[rig-llama-cpp] prefix-cache decode failed (cached={cached}, prompt_len={prompt_len}): {e}. \
+                 Falling back to fresh-context decode."
+            );
+            *persistent = None;
+            ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+            match prepare_prompt_decode(
+                persistent.as_mut().unwrap(),
+                &new_tokens,
+                0,
+                prompt_len,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    *persistent = None;
+                    return Err(e);
+                }
+            }
+        }
+        Err(e) => {
+            *persistent = None;
+            return Err(e);
+        }
+    };
+
+    // Phase 2: commit the prompt to last_tokens and sample. From this point on
+    // we may have streamed tokens to the consumer, so any failure invalidates
+    // the persistent slot but cannot be retried.
+    let p = persistent.as_mut().unwrap();
+    p.last_tokens = new_tokens;
+    let prompt_tokens = prompt_len as u64;
+    let cached_tokens = cached as u64;
+
+    let result = sample_tokens(
+        model,
+        &mut p.ctx,
+        &mut batch,
         &prompt_build,
         req,
         stream_tx,
-        model,
+        prompt_tokens,
+        cached_tokens,
+        &mut p.last_tokens,
     );
 
     if result.is_err() {
-        // Decode/sample failed mid-flight: KV state is now ambiguous. Drop the
-        // whole persistent slot so the next request rebuilds cleanly.
         *persistent = None;
     }
     result
 }
 
-fn run_text_inference_locked(
+fn ensure_persistent_ctx<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+) -> Result<(), String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
+
+    if persistent.is_some() {
+        return Ok(());
+    }
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_type_k(kv_cache.type_k)
+        .with_type_v(kv_cache.type_v);
+    let ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| format!("Context creation failed: {e}"))?;
+    *persistent = Some(PersistentCtx {
+        ctx,
+        last_tokens: Vec::new(),
+    });
+    Ok(())
+}
+
+/// Decode the prompt suffix into the persistent context's KV cache and return
+/// a batch ready for sampling. This is "phase 1" — safe to retry on failure
+/// because no output has been streamed to the consumer yet.
+fn prepare_prompt_decode<'b>(
     p: &mut PersistentCtx<'_>,
-    new_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    new_tokens: &[llama_cpp_2::token::LlamaToken],
     cached: usize,
     prompt_len: usize,
-    prompt_build: &PromptBuildResult,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    model: &llama_cpp_2::model::LlamaModel,
-) -> Result<InferenceResult, String> {
+) -> Result<llama_cpp_2::llama_batch::LlamaBatch<'b>, String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
     let ctx = &mut p.ctx;
-    let last = &mut p.last_tokens;
+    let last = &p.last_tokens;
+
+    if crate::llama_logs_enabled() {
+        eprintln!(
+            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached}",
+            last.len()
+        );
+    }
 
     if cached < last.len() {
-        ctx.clear_kv_cache_seq(Some(0), Some(cached as u32), None)
+        let removed = ctx
+            .clear_kv_cache_seq(Some(0), Some(cached as u32), None)
             .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+        if !removed {
+            return Err(format!(
+                "KV cache trim returned false (partial removal failed) at pos {cached}",
+            ));
+        }
     }
 
     let prompt_batch_limit = ctx.n_batch().max(1) as usize;
@@ -483,14 +555,28 @@ fn run_text_inference_locked(
                     .add(token, abs as i32, &[0], is_last_prompt_token)
                     .map_err(|e| format!("Batch add failed: {e}"))?;
             }
+            if batch.n_tokens() == 0 {
+                return Err(format!(
+                    "BUG: empty prompt batch at chunk {chunk_index} (suffix.len={}, prompt_batch_limit={})",
+                    suffix.len(),
+                    prompt_batch_limit,
+                ));
+            }
             ctx.decode(&mut batch)
                 .map_err(|e| format!("Prompt decode failed: {e}"))?;
         }
     } else {
         // Whole prompt already cached. Roll back the last position by one and
         // re-decode it so the sampler has a fresh `logits=true` slot to read.
-        ctx.clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
+        let removed = ctx
+            .clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
             .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+        if !removed {
+            return Err(format!(
+                "KV cache trim (rollback) returned false at pos {}",
+                prompt_len - 1
+            ));
+        }
         batch.clear();
         batch
             .add(
@@ -504,24 +590,7 @@ fn run_text_inference_locked(
             .map_err(|e| format!("Prompt decode failed: {e}"))?;
     }
 
-    // Commit the prompt portion to last_tokens before sampling so that an
-    // abort mid-generation still leaves the cache state consistent with what
-    // we'll claim on the next turn.
-    *last = new_tokens;
-    let prompt_tokens = prompt_len as u64;
-    let cached_tokens = cached as u64;
-
-    sample_tokens(
-        model,
-        ctx,
-        &mut batch,
-        prompt_build,
-        req,
-        stream_tx,
-        prompt_tokens,
-        cached_tokens,
-        last,
-    )
+    Ok(batch)
 }
 
 #[cfg(feature = "mtmd")]
