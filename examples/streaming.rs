@@ -1,7 +1,7 @@
 use rig::client::CompletionClient;
 use rig::streaming::StreamingPrompt;
 use rig::tool::ToolDyn;
-use rig_llama_cpp::{Client, FitParams, KvCacheParams, SamplingParams};
+use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde_json::json;
 
 #[path = "./helper/time.rs"]
@@ -21,6 +21,7 @@ async fn main() -> Result<(), anyhow::Error> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];

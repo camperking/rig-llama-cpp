@@ -4,7 +4,7 @@ use rig::completion::ToolDefinition;
 use rig::message::Message;
 use rig::streaming::{StreamedAssistantContent, StreamingChat, StreamedUserContent};
 use rig::tool::{Tool, ToolDyn};
-use rig_llama_cpp::{Client, FitParams, KvCacheParams, SamplingParams};
+use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -63,6 +63,7 @@ async fn main() -> Result<(), anyhow::Error> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(WriteFile)];

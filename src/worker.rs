@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroU32;
 
 use rig::completion::CompletionError;
@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 
 use crate::parsing::parse_completion_output;
 use crate::types::{
-    FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams, PreparedRequest,
-    PromptBuildResult, ResponseChannel, SamplerChain, StreamChunk, StreamDeltaState, StreamSender,
+    CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams,
+    PreparedRequest, PromptBuildResult, ResponseChannel, SamplerChain, StreamChunk,
+    StreamDeltaState, StreamSender,
 };
 
 struct WorkerModel {
@@ -148,17 +149,44 @@ fn fit_and_load_model(
 /// The lifetime `'m` borrows from the active `WorkerModel::model`. The struct is
 /// only ever constructed and dropped inside `handle_until_reload`, so it never
 /// outlives the model reference it borrows from.
+/// Snapshot of the partial seq state (recurrent + SWA KV) at a specific
+/// point in the conversation. Used by hybrid models (Qwen 3.5, Jamba, etc.)
+/// to recover prefix-cache reuse when a partial trim isn't possible.
+///
+/// Mirrors llama-server's `server_prompt_checkpoint`.
+struct Checkpoint {
+    /// Min position covered by the saved partial state at save time. We
+    /// don't currently consult this (the binding doesn't expose
+    /// `seq_pos_min`), but kept for diagnostic logging.
+    #[allow(dead_code)]
+    pos_min: i32,
+    /// Max position covered by the saved partial state — equal to
+    /// `n_tokens - 1`. Used to verify the snapshot is consistent with the
+    /// requested rollback target.
+    pos_max: i32,
+    /// Number of prompt tokens that had been decoded into the cache when
+    /// the snapshot was taken. The next request can resume decoding at
+    /// position `n_tokens` if its LCP length is at least this large.
+    n_tokens: usize,
+    /// Serialized partial state. Size matches whatever
+    /// `state_seq_get_size_ext(0, PARTIAL_ONLY)` returned at save time.
+    data: Vec<u8>,
+}
+
 struct PersistentCtx<'m> {
     ctx: llama_cpp_2::context::LlamaContext<'m>,
     last_tokens: Vec<llama_cpp_2::token::LlamaToken>,
     /// Set to true once we've observed that this model's memory implementation
     /// rejects partial cache trims (`clear_kv_cache_seq` returning `Ok(false)`).
     /// Recurrent/hybrid models like Mamba/RWKV/Jamba can't roll back the
-    /// recurrent state to an arbitrary position. When this flag is set we stop
-    /// attempting partial trims and instead fully clear + redecode whenever a
-    /// rollback would otherwise be needed. Extension-mode reuse
-    /// (`cached == last_tokens.len()`) still works.
+    /// recurrent state to an arbitrary position. When this flag is set we
+    /// route rollback requests through the checkpoint-restore path (or full
+    /// clear when no usable checkpoint exists). Extension-mode reuse
+    /// (`cached == last_tokens.len()`) works regardless.
     trim_unsupported: bool,
+    /// In-memory partial-state snapshots, oldest first. Bounded by
+    /// `CheckpointParams::max_checkpoints`.
+    checkpoints: VecDeque<Checkpoint>,
 }
 
 enum LoopOutcome {
@@ -174,6 +202,7 @@ enum LoopOutcome {
 fn handle_until_reload<'m>(
     backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
     wm: &'m WorkerModel,
+    checkpoint_params: CheckpointParams,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) -> LoopOutcome {
     let mut persistent: Option<PersistentCtx<'m>> = None;
@@ -198,6 +227,7 @@ fn handle_until_reload<'m>(
                             &wm.model,
                             wm.n_ctx,
                             &wm.kv_cache,
+                            checkpoint_params,
                             &mut persistent,
                             &params,
                             None,
@@ -211,6 +241,7 @@ fn handle_until_reload<'m>(
                             &wm.model,
                             wm.n_ctx,
                             &wm.kv_cache,
+                            checkpoint_params,
                             &mut persistent,
                             &params,
                             Some(&stream_tx),
@@ -247,6 +278,7 @@ pub(crate) fn inference_worker(
     n_ctx: u32,
     fit_params: &FitParams,
     kv_cache_params: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
@@ -278,8 +310,10 @@ pub(crate) fn inference_worker(
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
+    let mut checkpoint_params = checkpoint_params;
+
     loop {
-        match handle_until_reload(backend, &wm, rx) {
+        match handle_until_reload(backend, &wm, checkpoint_params, rx) {
             LoopOutcome::Reload(reload) => {
                 // The persistent context (held inside handle_until_reload) has
                 // already been dropped by the time we get here, so it is safe
@@ -299,6 +333,7 @@ pub(crate) fn inference_worker(
                 match result {
                     Ok(new_wm) => {
                         wm = new_wm;
+                        checkpoint_params = reload.checkpoint_params;
                         let _ = reload.result_tx.send(Ok(()));
                     }
                     Err(e) => {
@@ -318,13 +353,22 @@ fn run_inference<'m>(
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
 ) -> Result<InferenceResult, String> {
     run_inference_inner(
-        backend, model, n_ctx, kv_cache, persistent, req, stream_tx, mtmd_ctx,
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+        mtmd_ctx,
     )
 }
 
@@ -334,12 +378,22 @@ fn run_inference<'m>(
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     _mtmd_ctx: Option<&()>,
 ) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+    run_inference_inner(
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+    )
 }
 
 #[cfg(not(feature = "mtmd"))]
@@ -348,11 +402,21 @@ fn run_inference_inner<'m>(
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
-    run_text_inference(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+    run_text_inference(
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+    )
 }
 
 #[cfg(feature = "mtmd")]
@@ -361,6 +425,7 @@ fn run_inference_inner<'m>(
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
@@ -375,7 +440,16 @@ fn run_inference_inner<'m>(
         // path will simply decode as new suffix.
         run_image_inference(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
     } else {
-        run_text_inference(backend, model, n_ctx, kv_cache, persistent, req, stream_tx)
+        run_text_inference(
+            backend,
+            model,
+            n_ctx,
+            kv_cache,
+            checkpoint_params,
+            persistent,
+            req,
+            stream_tx,
+        )
     }
 }
 
@@ -392,6 +466,7 @@ fn run_text_inference<'m>(
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
@@ -429,12 +504,13 @@ fn run_text_inference<'m>(
     // Phase 1: prompt decode (with prefix-cache reuse). This phase is safe to
     // retry on failure because no output has been streamed yet. The helper
     // gracefully handles trim-unsupported memories (recurrent/hybrid) by
-    // fully clearing the cache instead of partial trimming.
+    // restoring the closest checkpoint or fully clearing the cache.
     let (mut batch, effective_cached) = match prepare_prompt_decode(
         persistent.as_mut().unwrap(),
         &new_tokens,
         cached,
         prompt_len,
+        checkpoint_params,
     ) {
         Ok(out) => out,
         Err(e) if cached > 0 => {
@@ -451,6 +527,7 @@ fn run_text_inference<'m>(
                 &new_tokens,
                 0,
                 prompt_len,
+                checkpoint_params,
             ) {
                 Ok(out) => out,
                 Err(e) => {
@@ -514,6 +591,7 @@ fn ensure_persistent_ctx<'m>(
         ctx,
         last_tokens: Vec::new(),
         trim_unsupported: false,
+        checkpoints: VecDeque::new(),
     });
     Ok(())
 }
@@ -524,64 +602,66 @@ fn ensure_persistent_ctx<'m>(
 /// possible). This is "phase 1" — safe to retry on failure because no output
 /// has been streamed to the consumer yet.
 ///
-/// Recurrent and hybrid memory implementations (Mamba/RWKV/Jamba) don't
-/// support partial KV-cache trims; for those we fully clear the cache and
-/// re-decode the whole prompt instead of failing the request.
+/// For models whose memory rejects partial trims (recurrent/hybrid), we
+/// attempt to restore from the closest in-memory state checkpoint before
+/// falling back to a full clear.
 fn prepare_prompt_decode<'b>(
     p: &mut PersistentCtx<'_>,
     new_tokens: &[llama_cpp_2::token::LlamaToken],
     cached: usize,
     prompt_len: usize,
+    checkpoint_params: CheckpointParams,
 ) -> Result<(llama_cpp_2::llama_batch::LlamaBatch<'b>, usize), String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
-    let ctx = &mut p.ctx;
-    let last = &mut p.last_tokens;
-
     if crate::llama_logs_enabled() {
         eprintln!(
-            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached} trim_unsupported={}",
-            last.len(),
-            p.trim_unsupported
+            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached} trim_unsupported={} checkpoints={}",
+            p.last_tokens.len(),
+            p.trim_unsupported,
+            p.checkpoints.len(),
         );
     }
 
     let mut effective_cached = cached;
 
-    if cached < last.len() {
+    if cached < p.last_tokens.len() {
         // Need to roll back the cache to position `cached`.
         if p.trim_unsupported {
-            // Already known: this model can't roll back. Fully clear and start
-            // over from position 0.
-            ctx.clear_kv_cache();
-            last.clear();
-            effective_cached = 0;
+            // Already known: trim refused before. Try checkpoint restore.
+            effective_cached = restore_or_clear(p, cached);
         } else {
-            let removed = ctx
+            let removed = p
+                .ctx
                 .clear_kv_cache_seq(Some(0), Some(cached as u32), None)
                 .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
-            if !removed {
-                // First time we've seen this model reject a partial trim.
-                // Mark it and fall back to a full clear so the rest of this
-                // request still goes through and future requests skip the
-                // trim attempt entirely.
+            if removed {
+                // Trim worked. Drop checkpoints whose pos_max >= cached because
+                // the state they captured is now invalid (positions ahead of
+                // the trim boundary).
+                p.checkpoints.retain(|c| (c.pos_max as usize) < cached);
+            } else {
+                // First time this model rejects a partial trim. Mark it and
+                // try the checkpoint path.
                 eprintln!(
                     "[rig-llama-cpp] partial KV-cache trim not supported by this model \
-                     (likely recurrent/hybrid). Disabling prefix-cache rollback for this session."
+                     (likely recurrent/hybrid). Routing rollbacks through checkpoint restore."
                 );
                 p.trim_unsupported = true;
-                ctx.clear_kv_cache();
-                last.clear();
-                effective_cached = 0;
+                effective_cached = restore_or_clear(p, cached);
             }
         }
+    } else {
+        // No rollback needed (extension only or full match). Drop checkpoints
+        // whose pos_max would land past where we're now operating.
+        p.checkpoints.retain(|c| (c.pos_max as usize) < cached.max(1));
     }
 
-    let prompt_batch_limit = ctx.n_batch().max(1) as usize;
+    let prompt_batch_limit = p.ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
 
     if effective_cached < prompt_len {
-        // Decode the new suffix only.
+        // Decode the new suffix.
         let suffix = &new_tokens[effective_cached..];
         for (chunk_index, chunk) in suffix.chunks(prompt_batch_limit).enumerate() {
             batch.clear();
@@ -599,15 +679,21 @@ fn prepare_prompt_decode<'b>(
                     prompt_batch_limit,
                 ));
             }
-            ctx.decode(&mut batch)
+            p.ctx
+                .decode(&mut batch)
                 .map_err(|e| format!("Prompt decode failed: {e}"))?;
+
+            let n_tokens_decoded =
+                effective_cached + chunk_index * prompt_batch_limit + chunk.len();
+            maybe_create_checkpoint(p, checkpoint_params, n_tokens_decoded, prompt_len);
         }
     } else {
         // Whole prompt already cached. Roll back the last position by one and
         // re-decode it so the sampler has a fresh `logits=true` slot to read.
-        // This is only reachable when trim is supported (otherwise we'd have
-        // taken the full-clear path above and reset effective_cached to 0).
-        let removed = ctx
+        // Only reachable when trim is supported (otherwise effective_cached
+        // would have been reset to 0 above).
+        let removed = p
+            .ctx
             .clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
             .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
         if !removed {
@@ -625,11 +711,150 @@ fn prepare_prompt_decode<'b>(
                 true,
             )
             .map_err(|e| format!("Batch add failed: {e}"))?;
-        ctx.decode(&mut batch)
+        p.ctx
+            .decode(&mut batch)
             .map_err(|e| format!("Prompt decode failed: {e}"))?;
     }
 
     Ok((batch, effective_cached))
+}
+
+/// Attempt to restore the closest in-memory checkpoint that covers a prefix
+/// of length `<= cached`. Returns the number of tokens now committed to the
+/// cache (`n_tokens` of the restored checkpoint, or `0` if no checkpoint
+/// was usable and we had to fully clear).
+///
+/// On success, the regular KV cache is also trimmed to the checkpoint's
+/// position so the cache state is consistent for subsequent decoding.
+fn restore_or_clear(p: &mut PersistentCtx<'_>, cached: usize) -> usize {
+    // Newest-first search for a checkpoint whose covered range fits within
+    // the prefix we want to keep. A checkpoint with `n_tokens > cached` would
+    // overshoot the LCP and put the cache into a state the new prompt
+    // doesn't actually share.
+    let candidate_idx = p
+        .checkpoints
+        .iter()
+        .rposition(|c| c.n_tokens <= cached && (c.pos_max as usize) < cached);
+
+    if let Some(idx) = candidate_idx {
+        let n_tokens = p.checkpoints[idx].n_tokens;
+        let restored = unsafe {
+            p.ctx.state_seq_set_data_ext(
+                &p.checkpoints[idx].data,
+                0,
+                llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY,
+            )
+        };
+
+        if restored {
+            // After restoring partial state, the recurrent/SWA state is at
+            // the checkpoint's position. Trim any stale regular-KV positions
+            // ahead of it. For hybrid models this trim now succeeds because
+            // the recurrent tail is no longer in the trim range.
+            let _ = p
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(n_tokens as u32), None);
+
+            // Truncate the tracked tokens to match.
+            p.last_tokens.truncate(n_tokens);
+
+            // Drop checkpoints AFTER this one (they captured later state we
+            // just rolled past).
+            p.checkpoints.truncate(idx + 1);
+
+            eprintln!(
+                "[rig-llama-cpp] restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})"
+            );
+            return n_tokens;
+        }
+
+        eprintln!("[rig-llama-cpp] state_seq_set_data_ext failed; clearing cache.");
+    }
+
+    // No usable checkpoint; full clear.
+    p.ctx.clear_kv_cache();
+    p.last_tokens.clear();
+    p.checkpoints.clear();
+    0
+}
+
+/// Decide whether to snapshot the partial seq state at this point in the
+/// prompt prefill, and do it if so. Mirrors the cadence used by
+/// `llama-server`: always near the end of the prompt, plus optionally
+/// every `every_n_tokens` during the bulk of the prompt.
+fn maybe_create_checkpoint(
+    p: &mut PersistentCtx<'_>,
+    params: CheckpointParams,
+    n_tokens_decoded: usize,
+    prompt_len: usize,
+) {
+    if params.max_checkpoints == 0 {
+        return;
+    }
+    if n_tokens_decoded < params.min_tokens as usize {
+        return;
+    }
+
+    let n_ubatch = p.ctx.n_ubatch().max(1) as usize;
+    // Same offsets as llama-server: 4 + n_ubatch and 4 tokens before the end
+    // of the prompt.
+    let near_end = n_tokens_decoded + 4 + n_ubatch == prompt_len
+        || n_tokens_decoded + 4 == prompt_len;
+
+    let last_n_tokens = p.checkpoints.back().map(|c| c.n_tokens).unwrap_or(0);
+    let cadence_ok = params.every_n_tokens > 0
+        && n_tokens_decoded.saturating_sub(last_n_tokens) >= params.every_n_tokens as usize;
+
+    if !(near_end || cadence_ok) {
+        return;
+    }
+    if !p
+        .checkpoints
+        .back()
+        .is_none_or(|c| n_tokens_decoded.saturating_sub(c.n_tokens) >= params.min_gap as usize)
+    {
+        return;
+    }
+
+    let size = p
+        .ctx
+        .state_seq_get_size_ext(0, llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY);
+    if size == 0 {
+        return;
+    }
+
+    let mut data = vec![0u8; size];
+    let written = unsafe {
+        p.ctx.state_seq_get_data_ext(
+            data.as_mut_ptr(),
+            0,
+            llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY,
+        )
+    };
+    if written == 0 {
+        return;
+    }
+    data.truncate(written);
+
+    while p.checkpoints.len() >= params.max_checkpoints as usize {
+        p.checkpoints.pop_front();
+    }
+
+    let pos_max = (n_tokens_decoded as i32).saturating_sub(1);
+    p.checkpoints.push_back(Checkpoint {
+        pos_min: 0,
+        pos_max,
+        n_tokens: n_tokens_decoded,
+        data,
+    });
+
+    if crate::llama_logs_enabled() {
+        eprintln!(
+            "[rig-llama-cpp] checkpoint created at n_tokens={n_tokens_decoded} (size={} KiB, total={})",
+            written / 1024,
+            p.checkpoints.len(),
+        );
+    }
 }
 
 #[cfg(feature = "mtmd")]

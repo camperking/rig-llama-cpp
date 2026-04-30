@@ -14,7 +14,10 @@ use tokio_stream::StreamExt;
 
 use rig::embeddings::EmbeddingModel as _;
 
-use crate::{Client, EmbeddingClient, FitParams, KvCacheParams, KvCacheType, Model, SamplingParams};
+use crate::{
+    CheckpointParams, Client, EmbeddingClient, FitParams, KvCacheParams, KvCacheType, Model,
+    SamplingParams,
+};
 use rig::completion::TypedPrompt;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -356,6 +359,7 @@ async fn e2e_inference_streaming_completion() -> anyhow::Result<()> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -476,6 +480,7 @@ async fn e2e_kv_cache_q8_0() -> anyhow::Result<()> {
             type_k: KvCacheType::Q8_0,
             type_v: KvCacheType::Q8_0,
         },
+        CheckpointParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -520,6 +525,7 @@ fn sequential_real_model_reload() -> anyhow::Result<()> {
             SamplingParams::default(),
             FitParams::default(),
             KvCacheParams::default(),
+            CheckpointParams::default(),
         )?;
     }
 
@@ -529,6 +535,7 @@ fn sequential_real_model_reload() -> anyhow::Result<()> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
 
     Ok(())
@@ -637,6 +644,7 @@ async fn vision_basic() -> anyhow::Result<()> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
     let model = client.completion_model("local");
 
@@ -688,6 +696,7 @@ fn load_model(gguf: &str) -> anyhow::Result<(Client, Model)> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
     let model = client.completion_model("local");
     Ok((client, model))

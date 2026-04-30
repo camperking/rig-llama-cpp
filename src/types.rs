@@ -66,6 +66,7 @@ pub(crate) struct ReloadRequest {
     pub n_ctx: u32,
     pub fit_params: FitParams,
     pub kv_cache_params: KvCacheParams,
+    pub checkpoint_params: CheckpointParams,
     pub result_tx: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
@@ -166,6 +167,53 @@ impl Default for FitParams {
         Self {
             margins: None,
             n_ctx_min: 4096,
+        }
+    }
+}
+
+/// Tunable parameters for the in-memory state-checkpoint cache used to
+/// preserve KV/recurrent state across chat turns for hybrid models.
+///
+/// Hybrid architectures (Qwen 3.5, Jamba, etc.) interleave Mamba-style
+/// recurrent layers with transformer layers. The recurrent state can't be
+/// rolled back to an arbitrary earlier position, so a partial KV trim
+/// fails whenever the next prompt diverges deep into the conversation.
+/// To work around this, we periodically snapshot the partial seq state
+/// (recurrent + SWA, via `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`) during
+/// prompt prefill and restore the closest snapshot when the next prompt
+/// arrives. Mirrors the mechanism used by upstream `llama-server`.
+///
+/// For non-hybrid models (Qwen 2.5, Llama 3, Gemma, ...) checkpoints are
+/// created but never used because the cheaper partial-trim path
+/// succeeds.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointParams {
+    /// Maximum number of checkpoints retained per persistent context.
+    /// `0` disables checkpointing entirely. Each checkpoint is a few MB
+    /// for typical hybrid models.
+    pub max_checkpoints: u32,
+    /// Approximate spacing between checkpoints during prompt prefill, in
+    /// tokens. The last `4..=4 + n_ubatch` tokens always get a
+    /// checkpoint regardless. `<= 0` means "only checkpoint near the end
+    /// of the prompt".
+    pub every_n_tokens: i32,
+    /// Don't checkpoint the very start of a prompt — saves space for
+    /// no benefit because we'd have to re-decode that prefix anyway if
+    /// it's the entire reuse window.
+    pub min_tokens: u32,
+    /// Don't take two checkpoints closer than this many tokens apart.
+    pub min_gap: u32,
+}
+
+impl Default for CheckpointParams {
+    fn default() -> Self {
+        Self {
+            // llama-server uses 32; cap lower because each checkpoint is
+            // a few MB and we'd rather not balloon RSS.
+            max_checkpoints: 8,
+            every_n_tokens: 8192,
+            min_tokens: 64,
+            min_gap: 64,
         }
     }
 }
