@@ -27,6 +27,10 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Added
 
+- Library-level diagnostics now go through the [`log`] crate facade.
+  ~25 internal `eprintln!` calls became `log::{info,debug,warn}!`, so
+  consumers can route output to `env_logger`, `tracing-log`, etc., and
+  level-filter via `RUST_LOG=rig_llama_cpp=debug` (or similar).
 - `with_*` setters (chainable, `#[must_use]`) on `SamplingParams`,
   `FitParams`, `KvCacheParams`, and `CheckpointParams`. External callers
   should now build these via `Default::default().with_x(...)` instead of
@@ -59,6 +63,12 @@ rather than caret-resolving across `0.x` boundaries.
   struct-literal syntax; use `Default::default()` plus the new `with_*`
   setters on the parameter structs. Future fields can now be added in a
   minor release.
+- **BREAKING (env semantics):** `RIG_LLAMA_CPP_LOGS` is now scoped to
+  llama.cpp's C-side log stream only (the `void_logs()` flag and the
+  `fit_params` log level). It no longer enables `rig-llama-cpp`'s own
+  Rust-side diagnostics — those go through the `log` crate. To see them,
+  configure your logger with `RUST_LOG=rig_llama_cpp=debug` (or the
+  equivalent for whichever logger backend you use).
 - Re-exported `ClientBuilder` from the crate root so its rustdoc renders
   on docs.rs.
 - Cleaned up stale rustdoc intra-doc links (`Client::from_gguf_with_fit`,

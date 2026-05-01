@@ -263,9 +263,7 @@ pub(crate) fn parse_completion_output(
     template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
     has_json_schema: bool,
 ) -> Result<OneOrMany<AssistantContent>, String> {
-    if crate::llama_logs_enabled() {
-        eprintln!("[rig-llama-cpp] raw output:\n{raw_text}");
-    }
+    log::debug!("raw output:\n{raw_text}");
 
     // When the caller set an output schema, grammar-constrained generation produces
     // a valid JSON object — but chat templates often wrap it in role tokens
@@ -280,15 +278,15 @@ pub(crate) fn parse_completion_output(
     if let Some(template_result) = template_result {
         match template_result.parse_response_oaicompat(raw_text, false) {
             Ok(parsed_json) => {
-                if crate::llama_logs_enabled() {
-                    eprintln!("[rig-llama-cpp] parsed response: {parsed_json}");
-                }
+                log::debug!("parsed response: {parsed_json}");
                 if let Ok(choice) = parse_oaicompat_message(&parsed_json, raw_text) {
                     return Ok(choice);
                 }
             }
             Err(err) => {
-                eprintln!("Failed to parse llama response as OpenAI-compatible content: {err} (will try XML fallback)");
+                log::warn!(
+                    "Failed to parse llama response as OpenAI-compatible content: {err} (will try XML fallback)"
+                );
             }
         }
     }

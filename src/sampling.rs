@@ -25,21 +25,18 @@ fn build_preserved_token_set(
         if let Ok(ids) = model.str_to_token(token_str, AddBos::Never) {
             if ids.len() == 1 {
                 set.insert(ids[0]);
-            } else if crate::llama_logs_enabled() {
-                eprintln!(
-                    "[rig-llama-cpp] preserved token {token_str:?} tokenized to {} ids (expected 1), skipping",
+            } else {
+                log::debug!(
+                    "preserved token {token_str:?} tokenized to {} ids (expected 1), skipping",
                     ids.len()
                 );
             }
-        } else if crate::llama_logs_enabled() {
-            eprintln!("[rig-llama-cpp] preserved token {token_str:?} not found in vocabulary");
+        } else {
+            log::debug!("preserved token {token_str:?} not found in vocabulary");
         }
     }
-    if crate::llama_logs_enabled() && !set.is_empty() {
-        eprintln!(
-            "[rig-llama-cpp] preserved tokens: {:?}",
-            tr.preserved_tokens
-        );
+    if !set.is_empty() {
+        log::debug!("preserved tokens: {:?}", tr.preserved_tokens);
     }
     set
 }
@@ -124,12 +121,10 @@ fn build_sampler_chain(
 
                 if trigger_patterns.is_empty() && trigger_tokens.is_empty() {
                     // No triggers means lazy grammar would never activate; fall back to eager.
-                    if crate::llama_logs_enabled() {
-                        eprintln!(
-                            "[rig-llama-cpp] grammar_lazy is true but no triggers found, \
-                             falling back to eager grammar"
-                        );
-                    }
+                    log::debug!(
+                        "grammar_lazy is true but no triggers found, \
+                         falling back to eager grammar"
+                    );
                     LlamaSampler::grammar(model, grammar_str, "root")
                 } else {
                     LlamaSampler::grammar_lazy_patterns(
@@ -146,21 +141,13 @@ fn build_sampler_chain(
 
             match result {
                 Ok(sampler) => {
-                    if crate::llama_logs_enabled() {
-                        eprintln!(
-                            "[rig-llama-cpp] grammar sampler created (lazy={})",
-                            tr.grammar_lazy
-                        );
-                    }
+                    log::debug!("grammar sampler created (lazy={})", tr.grammar_lazy);
                     Some(sampler)
                 }
                 Err(e) => {
-                    if crate::llama_logs_enabled() {
-                        eprintln!(
-                            "[rig-llama-cpp] grammar sampler creation failed, \
-                             falling back to unconstrained sampling: {e}"
-                        );
-                    }
+                    log::warn!(
+                        "grammar sampler creation failed, falling back to unconstrained sampling: {e}"
+                    );
                     None
                 }
             }
@@ -284,9 +271,7 @@ pub(crate) fn sample_tokens_from_pos(
         n_cur += 1;
     }
 
-    if crate::llama_logs_enabled() {
-        eprintln!("[rig-llama-cpp] raw output:\n{output}");
-    }
+    log::debug!("raw output:\n{output}");
 
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
@@ -421,9 +406,7 @@ pub(crate) fn sample_tokens(
         n_cur += 1;
     }
 
-    if crate::llama_logs_enabled() {
-        eprintln!("[rig-llama-cpp] raw output:\n{output}");
-    }
+    log::debug!("raw output:\n{output}");
 
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {

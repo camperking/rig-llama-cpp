@@ -20,7 +20,7 @@ Punch list for getting `rig-llama-cpp` ready to publish on crates.io. Roughly or
 
 ## Runtime quality
 
-- [ ] **Replace `eprintln!` with `log` or `tracing`.** 49 call sites. Library output should go through a logger downstream code can capture/route. `RIG_LLAMA_CPP_LOGS` env shim can stay as a thin compat layer.
+- [x] **Replace `eprintln!` with `log` or `tracing`.** Migrated to the `log` facade. ~25 library-side `eprintln!` sites became `log::{info,debug,warn}!` calls; level-gating is now the consumer's responsibility (`RUST_LOG=rig_llama_cpp=debug`). The `RIG_LLAMA_CPP_LOGS` env var is now scoped to llama.cpp's own C-side logging only (the `void_logs()` flag and the `fit_params` log_level), since those bypass Rust's logger. Doc-comment / test-only `println!` left untouched.
 - [ ] **Eliminate `unwrap()` on `persistent.as_ref()/as_mut()`** in `worker.rs:327/336/353/375` and `image.rs:85`. Invariant-protected today (`ensure_persistent_ctx` was just called) but brittle. Make `ensure_persistent_ctx` return `&mut PersistentCtx` instead of mutating an `Option`, so the type system carries the invariant.
 - [ ] **Document `expect("backend just set")` in `lib.rs:143`.** OnceLock flow guarantees it; add a `// SAFETY:`-style comment.
 - [ ] **Fix clippy warnings.** `cargo clippy --all-targets` reports 6 lib + 1 test:

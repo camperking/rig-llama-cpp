@@ -39,6 +39,7 @@ encoding_rs = "0.8"
 thiserror = "2.0.18"
 chrono = "0.4.44"
 tokio-stream = "0.1"
+log = "0.4"
 base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]

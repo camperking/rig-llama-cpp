@@ -344,8 +344,8 @@ fn run_text_inference<'m>(
         Err(e) if cached > 0 => {
             // Some other phase-1 failure mode. Drop persistent, rebuild fresh,
             // and retry from scratch. Safe because no output has streamed yet.
-            eprintln!(
-                "[rig-llama-cpp] prefix-cache decode failed (cached={cached}, prompt_len={prompt_len}): {e}. \
+            log::warn!(
+                "prefix-cache decode failed (cached={cached}, prompt_len={prompt_len}): {e}. \
                  Falling back to fresh-context decode."
             );
             *persistent = None;
@@ -414,14 +414,12 @@ fn prepare_prompt_decode<'b>(
 ) -> Result<(llama_cpp_2::llama_batch::LlamaBatch<'b>, usize), String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
-    if crate::llama_logs_enabled() {
-        eprintln!(
-            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_entries.len={} cached={cached} trim_unsupported={} checkpoints={}",
-            p.last_entries.len(),
-            p.trim_unsupported,
-            p.checkpoint_count(),
-        );
-    }
+    log::debug!(
+        "prefix-cache: prompt_len={prompt_len} last_entries.len={} cached={cached} trim_unsupported={} checkpoints={}",
+        p.last_entries.len(),
+        p.trim_unsupported,
+        p.checkpoint_count(),
+    );
 
     let mut effective_cached = cached;
 
@@ -443,8 +441,8 @@ fn prepare_prompt_decode<'b>(
             } else {
                 // First time this model rejects a partial trim. Mark it and
                 // try the checkpoint path.
-                eprintln!(
-                    "[rig-llama-cpp] partial KV-cache trim not supported by this model \
+                log::info!(
+                    "partial KV-cache trim not supported by this model \
                      (likely recurrent/hybrid). Routing rollbacks through checkpoint restore."
                 );
                 p.trim_unsupported = true;

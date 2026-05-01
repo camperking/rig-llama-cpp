@@ -155,13 +155,13 @@ pub(crate) fn restore_or_clear(p: &mut PersistentCtx<'_>, cached: usize) -> usiz
             // just rolled past).
             p.checkpoints.truncate(idx + 1);
 
-            eprintln!(
-                "[rig-llama-cpp] restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})"
+            log::debug!(
+                "restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})"
             );
             return n_tokens;
         }
 
-        eprintln!("[rig-llama-cpp] state_seq_set_data_ext failed; clearing cache.");
+        log::warn!("state_seq_set_data_ext failed; clearing cache.");
     }
 
     // No usable checkpoint; full clear.
@@ -241,11 +241,9 @@ pub(crate) fn maybe_create_checkpoint(
         data,
     });
 
-    if crate::llama_logs_enabled() {
-        eprintln!(
-            "[rig-llama-cpp] checkpoint created at n_tokens={n_tokens_decoded} (size={} KiB, total={})",
-            written / 1024,
-            p.checkpoints.len(),
-        );
-    }
+    log::debug!(
+        "checkpoint created at n_tokens={n_tokens_decoded} (size={} KiB, total={})",
+        written / 1024,
+        p.checkpoints.len(),
+    );
 }

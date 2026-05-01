@@ -35,28 +35,22 @@ pub(crate) fn build_prompt(
 
         match model.apply_chat_template_oaicompat(&tmpl, &params) {
             Ok(result) => {
-                if crate::llama_logs_enabled() {
-                    eprintln!("[rig-llama-cpp] messages_json: {}", request.messages_json);
-                    eprintln!("[rig-llama-cpp] enable_thinking: {}", request.enable_thinking);
-                    eprintln!("[rig-llama-cpp] chat_format: {}", result.chat_format);
-                    eprintln!("[rig-llama-cpp] has_parser: {}", result.parser.is_some());
-                    eprintln!(
-                        "[rig-llama-cpp] prompt contains <|think|>: {}",
-                        result.prompt.contains("<|think|>")
-                    );
-                    eprintln!("[rig-llama-cpp] rendered prompt:\n{}", result.prompt);
-                }
+                log::debug!("messages_json: {}", request.messages_json);
+                log::debug!("enable_thinking: {}", request.enable_thinking);
+                log::debug!("chat_format: {}", result.chat_format);
+                log::debug!("has_parser: {}", result.parser.is_some());
+                log::debug!(
+                    "prompt contains <|think|>: {}",
+                    result.prompt.contains("<|think|>")
+                );
+                log::debug!("rendered prompt:\n{}", result.prompt);
                 return Ok(PromptBuildResult {
                     prompt: result.prompt.clone(),
                     template_result: Some(result),
                 });
             }
             Err(e) => {
-                if crate::llama_logs_enabled() {
-                    eprintln!(
-                        "[rig-llama-cpp] apply_chat_template_oaicompat failed: {e}, falling back"
-                    );
-                }
+                log::debug!("apply_chat_template_oaicompat failed: {e}, falling back");
                 #[cfg(feature = "mtmd")]
                 if !request.images.is_empty() {
                     return Err(format!(

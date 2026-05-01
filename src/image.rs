@@ -92,15 +92,13 @@ pub(crate) fn run_image_inference<'m>(
         .iter()
         .any(|e| matches!(e, SlotEntry::Image { .. }));
 
-    if crate::llama_logs_enabled() {
-        eprintln!(
-            "[rig-llama-cpp] mtmd prefix-cache: prompt_len={prompt_len} last_entries.len={} \
-             cached_lcp={cached_lcp} suffix_has_image={suffix_has_image} \
-             prefix_has_image={prefix_has_image} trim_unsupported={}",
-            p.last_entries.len(),
-            p.trim_unsupported,
-        );
-    }
+    log::debug!(
+        "mtmd prefix-cache: prompt_len={prompt_len} last_entries.len={} \
+         cached_lcp={cached_lcp} suffix_has_image={suffix_has_image} \
+         prefix_has_image={prefix_has_image} trim_unsupported={}",
+        p.last_entries.len(),
+        p.trim_unsupported,
+    );
 
     // A rollback is needed iff the slot has more entries than the matched
     // prefix. On a hybrid/recurrent model this is only safe when the rollback
@@ -134,9 +132,7 @@ pub(crate) fn run_image_inference<'m>(
                     p.last_entries.truncate(cached_lcp);
                 }
                 Ok(false) => {
-                    eprintln!(
-                        "[rig-llama-cpp] mtmd: partial KV trim refused; full re-eval."
-                    );
+                    log::info!("mtmd: partial KV trim refused; full re-eval.");
                     p.trim_unsupported = true;
                     p.ctx.clear_kv_cache();
                     p.last_entries.clear();

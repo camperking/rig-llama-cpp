@@ -100,6 +100,13 @@ fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
+/// Whether to forward llama.cpp's *C-side* logging to stderr.
+///
+/// This only controls log lines that originate inside the `llama-cpp-2` /
+/// `llama-cpp-sys-2` C++ code (via `printf`-style writes that bypass Rust's
+/// `log` facade). Library-level diagnostics from `rig-llama-cpp` itself go
+/// through the [`log`] crate and are controlled by the consumer's logger
+/// configuration (e.g. `RUST_LOG=rig_llama_cpp=debug`), not this env var.
 fn llama_logs_enabled() -> bool {
     env_flag_enabled("RIG_LLAMA_CPP_LOGS")
 }

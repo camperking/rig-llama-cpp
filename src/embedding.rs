@@ -184,8 +184,6 @@ fn embedding_worker(
             return;
         }
     };
-    let logs_enabled = crate::llama_logs_enabled();
-
     let mut model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
     if backend.supports_gpu_offload() {
@@ -198,9 +196,7 @@ fn embedding_worker(
         if !vulkan_devices.is_empty() {
             model_params = match model_params.with_devices(&vulkan_devices) {
                 Ok(params) => {
-                    if logs_enabled {
-                        eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
-                    }
+                    log::info!("Using Vulkan backend devices: {vulkan_devices:?}");
                     params
                 }
                 Err(e) => {
@@ -211,9 +207,7 @@ fn embedding_worker(
         }
     }
 
-    if logs_enabled {
-        eprintln!("Loading embedding model from {model_path}...");
-    }
+    log::info!("Loading embedding model from {model_path}...");
 
     let model = match LlamaCppModel::load_from_file(backend, model_path, &model_params) {
         Ok(m) => m,
@@ -224,9 +218,7 @@ fn embedding_worker(
     };
 
     let ndims = model.n_embd() as usize;
-    if logs_enabled {
-        eprintln!("Embedding model loaded (ndims={ndims}).");
-    }
+    log::info!("Embedding model loaded (ndims={ndims}).");
 
     let _ = init_tx.send(Ok(ndims));
 

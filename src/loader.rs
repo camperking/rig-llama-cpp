@@ -40,9 +40,7 @@ pub(crate) fn fit_and_load_model(
             model_params = model_params
                 .with_devices(&vulkan_devices)
                 .map_err(|e| LoadError::ConfigureDevices(e.to_string()))?;
-            if logs_enabled {
-                eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
-            }
+            log::info!("Using Vulkan backend devices: {vulkan_devices:?}");
         }
     }
 
@@ -63,15 +61,16 @@ pub(crate) fn fit_and_load_model(
     let model_cstr = std::ffi::CString::new(model_path)
         .map_err(|e| LoadError::InvalidPath(e.to_string()))?;
 
+    // The C-side log level for `fit_params`. Routed via the
+    // `RIG_LLAMA_CPP_LOGS` env var, not through the `log` facade, because
+    // llama.cpp writes directly to stderr from C and bypasses Rust's logger.
     let log_level = if logs_enabled {
         llama_cpp_sys_2::GGML_LOG_LEVEL_INFO
     } else {
         llama_cpp_sys_2::GGML_LOG_LEVEL_NONE
     };
 
-    if logs_enabled {
-        eprintln!("Fitting model parameters for {model_path}...");
-    }
+    log::info!("Fitting model parameters for {model_path}...");
 
     let fit_result = pinned_params
         .as_mut()
@@ -86,30 +85,24 @@ pub(crate) fn fit_and_load_model(
 
     let actual_n_ctx = fit_result.n_ctx;
 
-    if logs_enabled {
-        eprintln!(
-            "Fit complete: n_gpu_layers={}, n_ctx={}",
-            pinned_params.n_gpu_layers(),
-            actual_n_ctx
-        );
-        eprintln!("Loading model from {model_path}...");
-    }
+    log::info!(
+        "Fit complete: n_gpu_layers={}, n_ctx={}",
+        pinned_params.n_gpu_layers(),
+        actual_n_ctx
+    );
+    log::info!("Loading model from {model_path}...");
 
     let model = LlamaCppModel::load_from_file(backend, model_path, &pinned_params)
         .map_err(|e| LoadError::ModelLoad(e.to_string()))?;
 
-    if logs_enabled {
-        eprintln!("Model loaded.");
-    }
+    log::info!("Model loaded.");
 
     #[cfg(feature = "mtmd")]
     let mtmd_ctx = if let Some(mmproj) = mmproj_path {
         let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
         let ctx = llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params)
             .map_err(|e| LoadError::MmprojInit(e.to_string()))?;
-        if logs_enabled {
-            eprintln!("Multimodal projector loaded from {mmproj}.");
-        }
+        log::info!("Multimodal projector loaded from {mmproj}.");
         Some(ctx)
     } else {
         None
