@@ -38,9 +38,9 @@ Punch list for getting `rig-llama-cpp` ready to publish on crates.io. Roughly or
 
 ## Docs
 
-- [ ] **Audit doc comments for stale names.** `types.rs:164` references the old `from_gguf_with_fit` name. Sweep for similar.
-- [ ] **Expand backend feature matrix in README.** Current matrix says "Vulkan default" but doesn't tell users what `vulkan` actually requires (libvulkan + drivers + working device). Add a 5-line "platform notes" section.
-- [ ] **Verify MSRV in CI.** Add `package.rust-version` and have CI compile against that exact version, or doctests will rot silently.
+- [x] **Audit doc comments for stale names.** Swept for stale `from_gguf_with_fit` references (gone), confirmed all `[`Client::*`]` / `[`Model::*`]` intra-doc links resolve, and verified `cargo doc --no-deps [--features mtmd]` is warning-free under `RUSTDOCFLAGS=-D warnings`. The remaining `n_gpu_layers` / `camperking` mentions are legitimate (the embedding API genuinely takes `n_gpu_layers`; the repo URL points at the upstream owner; the CHANGELOG references the deprecated fork in a backwards-looking entry).
+- [x] **Expand backend feature matrix in README.** Added a "Platform notes" subsection covering runtime requirements (driver + device) for each GPU backend, the `lavapipe`-builds-but-is-slow caveat for `vulkan`, the CUDA-toolkit-vs-driver match for `cuda`, the macOS-only constraint on `metal`, and the gfx9/RDNA/CDNA support window for `rocm`. Also pointed out that `LoadError::BackendInit` is returned (not panicked) on runtime init failure so callers can fall back gracefully.
+- [x] **Verify MSRV in CI.** Added a second `msrv` job to `.github/workflows/ci.yml` that reads `rust-version` from `Cargo.toml`, installs that exact toolchain via `dtolnay/rust-toolchain@master`, and runs `cargo check --all-targets` (default + `--features mtmd`). `cargo check` only — clippy and rustfmt shipped behaviour changes between 1.88 and stable, and we already cover those on stable in the main `check` job.
 
 ## Recommended order
 

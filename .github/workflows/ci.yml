@@ -56,3 +56,37 @@ jobs:
 
       - name: cargo doc (--features mtmd)
         run: cargo doc --no-deps --features mtmd
+
+  # MSRV verification: build against the exact Rust version declared in
+  # Cargo.toml's `rust-version` so doctests / let-chains / new lints can't
+  # regress the floor without us noticing. `cargo check` only — `clippy` and
+  # `rustfmt` shipped behaviour changes between MSRV and stable, and we
+  # already cover those in the `check` job above.
+  msrv:
+    name: msrv (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(grep -E '^rust-version\s*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Pinned MSRV: $msrv"
+
+      - name: Install Rust toolchain (MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo registry + target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      - name: cargo check (default features)
+        run: cargo check --all-targets
+
+      - name: cargo check (--features mtmd)
+        run: cargo check --all-targets --features mtmd

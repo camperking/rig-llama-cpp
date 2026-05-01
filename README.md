@@ -45,6 +45,25 @@ cargo build --features openmp
 Backend support also depends on the corresponding `llama-cpp-2` feature and the
 host machine actually having the listed runtime libraries available.
 
+### Platform notes
+
+A successful build does not guarantee a successful run — the host still
+needs the right driver and an actually-supported device. If backend init
+fails at runtime, [`LoadError::BackendInit`] is returned rather than
+panicking, so the application can fall back gracefully.
+
+- **`vulkan`** — needs `libvulkan` (e.g. `libvulkan1` on Debian/Ubuntu) plus a
+  working ICD: `mesa-vulkan-drivers` for AMD/Intel/llvmpipe, the proprietary
+  driver for NVIDIA. `vulkaninfo` should report a non-CPU device for real
+  performance; `lavapipe` (CPU-rendered Vulkan) builds and runs but is slow.
+- **`cuda`** — needs a CUDA toolkit version that matches the installed
+  NVIDIA driver. Mismatch produces a runtime error from `cudaErrorDriver`.
+- **`metal`** — macOS only. Cross-compiling to Linux/Windows with this
+  feature on will fail at the `llama-cpp-sys-2` build step.
+- **`rocm`** — needs the ROCm runtime (`/opt/rocm`) and a supported AMD GPU
+  (gfx9 / RDNA / CDNA). Older / consumer-only devices may be ignored even
+  if ROCm itself installs cleanly.
+
 ## Usage
 
 ```rust
