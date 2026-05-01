@@ -42,17 +42,16 @@ native toolchain or system libraries being available on the host machine.
 ```rust
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig_llama_cpp::{ Client, FitParams, KvCacheParams, SamplingParams };
+use rig_llama_cpp::Client;
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let client = Client::from_gguf(
-        "path/to/model.gguf",
-        8192, // n_ctx
-        SamplingParams::default(),
-        FitParams::default(),
-        KvCacheParams::default(), // F16 K + F16 V — try KvCacheType::Q8_0 to halve KV VRAM
-    )?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The minimal form — every other knob has a sensible default. Chain
+    // .n_ctx, .sampling, .fit, .kv_cache, .checkpoints, or (with the
+    // `mtmd` feature) .mmproj to override.
+    let client = Client::builder("path/to/model.gguf")
+        .n_ctx(8192)
+        .build()?;
 
     let agent = client
         .agent("local")
@@ -65,6 +64,9 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 ```
+
+The legacy positional `Client::from_gguf(...)` constructor is still
+available for callers pinned to the 0.1.x API.
 
 ## Examples
 

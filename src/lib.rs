@@ -38,18 +38,12 @@
 //! ```rust,no_run
 //! use rig::client::CompletionClient;
 //! use rig::completion::Prompt;
-//! use rig_llama_cpp::{CheckpointParams, FitParams, KvCacheParams, SamplingParams};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = rig_llama_cpp::Client::from_gguf(
-//!     "path/to/model.gguf",
-//!     8192, // n_ctx
-//!     SamplingParams::default(),
-//!     FitParams::default(),
-//!     KvCacheParams::default(),
-//!     CheckpointParams::default(),
-//! )?;
+//! let client = rig_llama_cpp::Client::builder("path/to/model.gguf")
+//!     .n_ctx(8192)
+//!     .build()?;
 //!
 //! let agent = client
 //!     .agent("local")

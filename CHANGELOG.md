@@ -27,12 +27,19 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Added
 
+- `Client::builder(model_path)` returns a `ClientBuilder` with `.n_ctx`,
+  `.sampling`, `.fit`, `.kv_cache`, `.checkpoints`, and `.mmproj` (mtmd-only)
+  setters. Defaults to `n_ctx = 4096` plus `Default::default()` for every
+  parameter struct. Future optional knobs can be added without breaking
+  existing call sites. The legacy positional `from_gguf` /
+  `from_gguf_with_mmproj` constructors still work and now delegate to the
+  same internal spawn helper as the builder.
 - `LoadError` (`thiserror`, `#[non_exhaustive]`): typed error returned by
   `Client::from_gguf`, `Client::from_gguf_with_mmproj`, `Client::reload`,
-  and `EmbeddingClient::from_gguf` instead of `anyhow::Error` /
-  `Result<(), String>`. Variants: `BackendInit`, `ConfigureDevices`,
-  `Fit`, `ModelLoad`, `MmprojInit` (mtmd-only), `InvalidPath`,
-  `WorkerInitDisconnected`, `WorkerNotRunning`.
+  `Client::builder().build()`, and `EmbeddingClient::from_gguf` instead of
+  `anyhow::Error` / `Result<(), String>`. Variants: `BackendInit`,
+  `ConfigureDevices`, `Fit`, `ModelLoad`, `MmprojInit` (mtmd-only),
+  `InvalidPath`, `WorkerInitDisconnected`, `WorkerNotRunning`.
 
 ### Changed
 

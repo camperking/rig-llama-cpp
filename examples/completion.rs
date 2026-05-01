@@ -1,7 +1,7 @@
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
 use rig::tool::ToolDyn;
-use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
+use rig_llama_cpp::Client;
 use serde_json::json;
 
 #[path = "./helper/time.rs"]
@@ -12,14 +12,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let model_path =
         std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your GGUF model file path");
 
-    let client = Client::from_gguf(
-        &model_path,
-        8192,
-        SamplingParams::default(),
-        FitParams::default(),
-        KvCacheParams::default(),
-        CheckpointParams::default(),
-    )?;
+    let client = Client::builder(&model_path).n_ctx(8192).build()?;
 
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
 
