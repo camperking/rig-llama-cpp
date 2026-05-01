@@ -93,7 +93,7 @@ fn fit_and_load_model(
             &mut cparams,
             &mut margins,
             fit.n_ctx_min,
-            log_level as u32,
+            log_level,
         )
         .map_err(|e| format!("Parameter fitting failed: {e}"))?;
 
@@ -319,37 +319,33 @@ pub(crate) fn inference_worker(
 
     let mut checkpoint_params = checkpoint_params;
 
-    loop {
-        match handle_until_reload(backend, &wm, checkpoint_params, rx) {
-            LoopOutcome::Reload(reload) => {
-                // The persistent context (held inside handle_until_reload) has
-                // already been dropped by the time we get here, so it is safe
-                // to drop and replace `wm`.
-                drop(wm);
+    while let LoopOutcome::Reload(reload) = handle_until_reload(backend, &wm, checkpoint_params, rx)
+    {
+        // The persistent context (held inside handle_until_reload) has
+        // already been dropped by the time we get here, so it is safe
+        // to drop and replace `wm`.
+        drop(wm);
 
-                let result = fit_and_load_model(
-                    backend,
-                    &reload.model_path,
-                    reload.mmproj_path.as_deref(),
-                    reload.n_ctx,
-                    &reload.fit_params,
-                    &reload.kv_cache_params,
-                    logs_enabled,
-                );
+        let result = fit_and_load_model(
+            backend,
+            &reload.model_path,
+            reload.mmproj_path.as_deref(),
+            reload.n_ctx,
+            &reload.fit_params,
+            &reload.kv_cache_params,
+            logs_enabled,
+        );
 
-                match result {
-                    Ok(new_wm) => {
-                        wm = new_wm;
-                        checkpoint_params = reload.checkpoint_params;
-                        let _ = reload.result_tx.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = reload.result_tx.send(Err(e));
-                        return;
-                    }
-                }
+        match result {
+            Ok(new_wm) => {
+                wm = new_wm;
+                checkpoint_params = reload.checkpoint_params;
+                let _ = reload.result_tx.send(Ok(()));
             }
-            LoopOutcome::Shutdown => break,
+            Err(e) => {
+                let _ = reload.result_tx.send(Err(e));
+                return;
+            }
         }
     }
 }
@@ -820,10 +816,10 @@ fn maybe_create_checkpoint(
     if !(near_end || cadence_ok) {
         return;
     }
-    if !p
+    if p
         .checkpoints
         .back()
-        .is_none_or(|c| n_tokens_decoded.saturating_sub(c.n_tokens) >= params.min_gap as usize)
+        .is_some_and(|c| n_tokens_decoded.saturating_sub(c.n_tokens) < params.min_gap as usize)
     {
         return;
     }
