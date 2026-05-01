@@ -138,17 +138,31 @@ downloads on the first run. The script does not run in CI — backend
 compilation is already covered upstream by `llama-cpp-rs`, and the model
 fixtures are too large for hosted runners.
 
-## Use latest llama.cpp
+## Contributing
 
-To use the latest version of llama.cpp, clone the repo and point to the path in `Cargo.toml`. Make sure to update the submodules as well.
+Issues and pull requests are welcome at
+[github.com/camperking/rig-llama-cpp](https://github.com/camperking/rig-llama-cpp).
+
+Before opening a PR, please run the same checks CI does
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 ```sh
-git clone --recursive https://github.com/utilityai/llama-cpp-rs
-git submodule update --init --recursive
+cargo fmt --all --check
+cargo clippy --no-deps --all-targets -- -D warnings
+cargo clippy --no-deps --all-targets --features mtmd -- -D warnings
+cargo test --lib
+cargo test --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features mtmd
 ```
 
-Then update the dependency in `Cargo.toml`:
-`llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2" }`
+If your change touches inference behaviour, validate it locally with
+`./run_tests.sh` (downloads ~20 GB of GGUF fixtures and runs the full
+integration suite — see the [Testing](#testing) section).
+
+For changes that affect the public API or the embedded `llama-cpp-2`
+version, add an entry to [`CHANGELOG.md`](CHANGELOG.md) under
+`[Unreleased]`. The crate's pre-1.0 SemVer policy is documented at the
+top of that file.
 
 ## License
 
