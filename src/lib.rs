@@ -79,9 +79,6 @@ mod slot;
 mod types;
 mod worker;
 
-#[cfg(test)]
-mod test;
-
 pub use client::{Client, ClientBuilder, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
 pub use error::LoadError;

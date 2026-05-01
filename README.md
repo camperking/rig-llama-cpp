@@ -100,15 +100,18 @@ cargo test --lib
 cargo test --doc
 ```
 
-The full integration suite needs real GGUF models and runs every test marked
-`#[ignore]`: streaming completions, vision, tool roundtrips, structured
-output, KV-cache quantization, embedding, and sequential model reload.
-`./run_tests.sh` downloads the fixtures (Qwen 3.5-2B, Gemma-4 E4B, and the
-nomic-embed-text-v2 embedding model) into the working directory via
-`hf download` and runs each suite end-to-end. Plan for ~20 GB of model
-downloads on the first run. The script does not run in CI — backend
-compilation is already covered upstream by `llama-cpp-rs`, and the model
-fixtures are too large for hosted runners.
+The full integration suite (`tests/e2e/`) covers streaming completions,
+vision, tool roundtrips, structured output, KV-cache quantization,
+embedding, and sequential model reload. All tests are `#[ignore]`d and
+auto-download their fixtures via `hf-hub` into the standard HuggingFace
+cache (`~/.cache/huggingface/hub`) on first run — plan for ~20 GB.
+Backend compilation is already covered upstream by `llama-cpp-rs`, and
+the model fixtures are too large for hosted runners, so the e2e suite
+does not run in CI.
+
+```sh
+cargo test --test e2e --features mtmd -- --ignored --nocapture
+```
 
 ## Contributing
 
@@ -128,8 +131,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features mtmd
 ```
 
 If your change touches inference behaviour, validate it locally with
-`./run_tests.sh` (downloads ~20 GB of GGUF fixtures and runs the full
-integration suite — see the [Testing](#testing) section).
+`cargo test --test e2e --features mtmd -- --ignored --nocapture` — the
+fixtures auto-download on first run (~20 GB; see the
+[Testing](#testing) section).
 
 For changes that affect the public API or the embedded `llama-cpp-2`
 version, add an entry to [`CHANGELOG.md`](CHANGELOG.md) under

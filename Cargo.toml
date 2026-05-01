@@ -45,3 +45,17 @@ base64 = { version = "0.22", optional = true }
 [dev-dependencies]
 schemars = "1"
 anyhow = "1"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+# Forces e2e tests to run sequentially. Cargo's default test runner is
+# parallel, but loading multiple GGUF models at once OOMs the GPU and
+# concurrent first-time hf-hub downloads of the same file race the
+# cache. `#[serial]` on every e2e test serialises both naturally.
+serial_test = { version = "3", default-features = false, features = ["async"] }
+
+# E2E integration tests live under `tests/e2e/` as a single binary so they
+# share a `common` helper module (auto-download via hf-hub, RunSummary,
+# corpus prompts, etc.). Cargo only auto-discovers `tests/*.rs`, so we
+# declare the binary explicitly.
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
