@@ -32,9 +32,9 @@ Punch list for getting `rig-llama-cpp` ready to publish on crates.io. Roughly or
 
 ## Testing & CI
 
-- [ ] **Add CI.** No `.github/workflows/` in the repo. At minimum: `cargo check` on each backend feature combo (matrix: `default`, `cuda` no-default, `metal` no-default on mac runner, `openmp`, `mtmd`), `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo doc --no-deps`. Model-bearing tests stay `#[ignore]` and run only with `MODEL_PATH` set.
-- [ ] **Split unit tests from model-bearing tests.** `src/test.rs` is 928 lines and largely `#[ignore]`. Move pure parsing tests into a non-ignored unit-test module so `cargo test` exercises real coverage without a GGUF.
-- [ ] **Document or replace `run_tests.sh`.** Either document in README or replace with `cargo test --features mtmd -- --include-ignored` + env vars.
+- [x] **Add CI.** Single-job `.github/workflows/ci.yml` on `ubuntu-latest`: `cargo fmt --check`, `cargo clippy --no-deps --all-targets -- -D warnings` (default + mtmd), `cargo test --lib`, `cargo test --doc`, `cargo doc --no-deps --features mtmd` with `RUSTDOCFLAGS=-D warnings`. Cached via `Swatinem/rust-cache@v2`; concurrency-cancelled on rapid pushes. Deliberately **no GPU backend matrix** — `llama-cpp-rs` upstream already validates backend compilation and our default build is CPU-only, so a single Ubuntu run covers our delta. Model-bearing tests stay `#[ignore]`.
+- [ ] **Split unit tests from model-bearing tests.** `src/test.rs` is 928 lines, mostly `#[ignore]`. The default `cargo test --lib` already runs 23 non-model tests (slot tests + parsing helpers picked up implicitly), so this is a readability cleanup, not a coverage gap. Defer until the file grows further.
+- [x] **Document `run_tests.sh` in README.** Added a "Testing" section that distinguishes the fast `cargo test --lib` / `--doc` path (the CI surface) from the full `run_tests.sh` integration suite which fetches GGUF fixtures and runs every `#[ignore]` test. Called out the ~20 GB model-download cost and noted why CI does not run it.
 
 ## Docs
 

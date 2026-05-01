@@ -99,6 +99,24 @@ RIG_MODEL_A=./model_a.gguf RIG_MODEL_B=./model_b.gguf cargo run --example reload
 By default, llama.cpp backend logs are suppressed so streaming and test output stay readable.
 Set `RIG_LLAMA_CPP_LOGS=1` to re-enable raw backend logs when debugging model startup or decode issues.
 
+## Testing
+
+```sh
+# Fast unit tests + doctests — no model required, run on every CI build.
+cargo test --lib
+cargo test --doc
+```
+
+The full integration suite needs real GGUF models and runs every test marked
+`#[ignore]`: streaming completions, vision, tool roundtrips, structured
+output, KV-cache quantization, embedding, and sequential model reload.
+`./run_tests.sh` downloads the fixtures (Qwen 3.5-2B, Gemma-4 E4B, and the
+nomic-embed-text-v2 embedding model) into the working directory via
+`hf download` and runs each suite end-to-end. Plan for ~20 GB of model
+downloads on the first run. The script does not run in CI — backend
+compilation is already covered upstream by `llama-cpp-rs`, and the model
+fixtures are too large for hosted runners.
+
 ## Use latest llama.cpp
 
 To use the latest version of llama.cpp, clone the repo and point to the path in `Cargo.toml`. Make sure to update the submodules as well.

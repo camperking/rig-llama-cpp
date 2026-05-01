@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail rustdoc on broken intra-doc links / missing items so doc rot can't
+  # land silently.
+  RUSTDOCFLAGS: -D warnings
+
+# Cancel in-flight runs on the same ref when a new push lands. Keeps Actions
+# minutes from piling up on rapid pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Single job covering everything that doesn't need a GGUF model:
+  # formatting, lints, the non-`#[ignore]` unit tests, doctests, and the
+  # rustdoc build. We deliberately don't matrix across GPU backends —
+  # llama-cpp-rs already validates backend compilation upstream and our
+  # default build is CPU-only, so a single ubuntu-latest run covers our
+  # delta. Model-bearing tests are `#[ignore]` and require `MODEL_PATH`,
+  # so they don't execute here (run them locally via `run_tests.sh`).
+  check:
+    name: check / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target/
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (default features)
+        run: cargo clippy --no-deps --all-targets -- -D warnings
+
+      - name: cargo clippy (--features mtmd)
+        run: cargo clippy --no-deps --all-targets --features mtmd -- -D warnings
+
+      - name: cargo test --lib (model-bearing tests stay #[ignore])
+        run: cargo test --lib
+
+      - name: cargo test --doc
+        run: cargo test --doc
+
+      - name: cargo doc (--features mtmd)
+        run: cargo doc --no-deps --features mtmd
