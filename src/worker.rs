@@ -21,6 +21,37 @@ enum LoopOutcome {
     Shutdown,
 }
 
+/// Borrowed view of the worker's loaded-model environment, threaded through
+/// the inference call chain to keep individual function signatures small.
+///
+/// The lifetimes:
+///
+/// - `'m` is the lifetime of the loaded `LlamaModel` / `LlamaBackend` —
+///   shared with [`PersistentCtx`] so the persistent KV cache borrows from
+///   the same model.
+/// - `'a` borrows the per-request reads (`kv_cache`, mtmd context) for the
+///   duration of a single inference call.
+pub(crate) struct RunCtx<'a, 'm> {
+    pub(crate) backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    pub(crate) model: &'m llama_cpp_2::model::LlamaModel,
+    pub(crate) n_ctx: u32,
+    pub(crate) kv_cache: &'a KvCacheParams,
+    pub(crate) checkpoint_params: CheckpointParams,
+    #[cfg(feature = "mtmd")]
+    pub(crate) mtmd_ctx: Option<&'a llama_cpp_2::mtmd::MtmdContext>,
+}
+
+/// Bringup parameters for [`inference_worker`]. Folded into a struct so the
+/// worker entry point stays under clippy's `too_many_arguments` threshold.
+pub(crate) struct WorkerInit<'a> {
+    pub(crate) model_path: &'a str,
+    pub(crate) mmproj_path: Option<&'a str>,
+    pub(crate) n_ctx: u32,
+    pub(crate) fit_params: &'a FitParams,
+    pub(crate) kv_cache_params: &'a KvCacheParams,
+    pub(crate) checkpoint_params: CheckpointParams,
+}
+
 /// Inner request loop that owns the persistent context.
 ///
 /// Returns when the channel closes, a reload is requested, or shutdown is requested.
@@ -42,38 +73,24 @@ fn handle_until_reload<'m>(
                     response_channel,
                 } = req;
 
-                #[cfg(feature = "mtmd")]
-                let mtmd_ref = wm.mtmd_ctx.as_ref();
-                #[cfg(not(feature = "mtmd"))]
-                let mtmd_ref: Option<&()> = None;
+                let ctx = RunCtx {
+                    backend,
+                    model: &wm.model,
+                    n_ctx: wm.n_ctx,
+                    kv_cache: &wm.kv_cache,
+                    checkpoint_params,
+                    #[cfg(feature = "mtmd")]
+                    mtmd_ctx: wm.mtmd_ctx.as_ref(),
+                };
 
                 match response_channel {
                     ResponseChannel::Completion(tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            checkpoint_params,
-                            &mut persistent,
-                            &params,
-                            None,
-                            mtmd_ref,
-                        );
+                        let result = run_inference(&ctx, &mut persistent, &params, None);
                         let _ = tx.send(result);
                     }
                     ResponseChannel::Streaming(stream_tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            checkpoint_params,
-                            &mut persistent,
-                            &params,
-                            Some(&stream_tx),
-                            mtmd_ref,
-                        );
+                        let result =
+                            run_inference(&ctx, &mut persistent, &params, Some(&stream_tx));
                         match result {
                             Ok(result) => {
                                 let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
@@ -100,12 +117,7 @@ fn handle_until_reload<'m>(
 }
 
 pub(crate) fn inference_worker(
-    model_path: &str,
-    mmproj_path: Option<&str>,
-    n_ctx: u32,
-    fit_params: &FitParams,
-    kv_cache_params: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
+    init: WorkerInit<'_>,
     init_tx: std::sync::mpsc::Sender<Result<(), LoadError>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
@@ -120,11 +132,11 @@ pub(crate) fn inference_worker(
 
     let mut wm = match fit_and_load_model(
         backend,
-        model_path,
-        mmproj_path,
-        n_ctx,
-        fit_params,
-        kv_cache_params,
+        init.model_path,
+        init.mmproj_path,
+        init.n_ctx,
+        init.fit_params,
+        init.kv_cache_params,
         logs_enabled,
     ) {
         Ok(wm) => wm,
@@ -137,7 +149,7 @@ pub(crate) fn inference_worker(
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
-    let mut checkpoint_params = checkpoint_params;
+    let mut checkpoint_params = init.checkpoint_params;
 
     while let LoopOutcome::Reload(reload) = handle_until_reload(backend, &wm, checkpoint_params, rx)
     {
@@ -170,115 +182,22 @@ pub(crate) fn inference_worker(
     }
 }
 
-#[cfg(feature = "mtmd")]
+/// Top-level inference dispatch: text-only by default, multimodal when the
+/// request carries images and an mtmd context is available.
 fn run_inference<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
-    persistent: &mut Option<PersistentCtx<'m>>,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
-) -> Result<InferenceResult, String> {
-    run_inference_inner(
-        backend,
-        model,
-        n_ctx,
-        kv_cache,
-        checkpoint_params,
-        persistent,
-        req,
-        stream_tx,
-        mtmd_ctx,
-    )
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
-    persistent: &mut Option<PersistentCtx<'m>>,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    _mtmd_ctx: Option<&()>,
-) -> Result<InferenceResult, String> {
-    run_inference_inner(
-        backend,
-        model,
-        n_ctx,
-        kv_cache,
-        checkpoint_params,
-        persistent,
-        req,
-        stream_tx,
-    )
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference_inner<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
+    ctx: &RunCtx<'_, 'm>,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
-    run_text_inference(
-        backend,
-        model,
-        n_ctx,
-        kv_cache,
-        checkpoint_params,
-        persistent,
-        req,
-        stream_tx,
-    )
-}
-
-#[cfg(feature = "mtmd")]
-fn run_inference_inner<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
-    persistent: &mut Option<PersistentCtx<'m>>,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
-) -> Result<InferenceResult, String> {
-    let has_images = !req.prepared_request.images.is_empty();
-
-    if has_images && mtmd_ctx.is_some() {
-        run_image_inference(
-            backend,
-            model,
-            n_ctx,
-            kv_cache,
-            persistent,
-            req,
-            stream_tx,
-            mtmd_ctx,
-        )
-    } else {
-        run_text_inference(
-            backend,
-            model,
-            n_ctx,
-            kv_cache,
-            checkpoint_params,
-            persistent,
-            req,
-            stream_tx,
-        )
+    #[cfg(feature = "mtmd")]
+    {
+        let has_images = !req.prepared_request.images.is_empty();
+        if has_images && ctx.mtmd_ctx.is_some() {
+            return run_image_inference(ctx, persistent, req, stream_tx);
+        }
     }
+    run_text_inference(ctx, persistent, req, stream_tx)
 }
 
 /// Text-only inference with persistent-context + prefix-cache reuse.
@@ -290,21 +209,18 @@ fn run_inference_inner<'m>(
 /// trims), we invalidate the persistent slot and retry once with a fresh
 /// context — so the user's request still succeeds at the cost of a full decode.
 fn run_text_inference<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    checkpoint_params: CheckpointParams,
+    ctx: &RunCtx<'_, 'm>,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
     use llama_cpp_2::model::AddBos;
 
-    let prompt_build = build_prompt(model, &req.prepared_request)?;
+    let prompt_build = build_prompt(ctx.model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let new_tokens = model
+    let new_tokens = ctx
+        .model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| format!("Tokenization failed: {e}"))?;
     let prompt_len = new_tokens.len();
@@ -312,9 +228,10 @@ fn run_text_inference<'m>(
     if prompt_len == 0 {
         return Err("Empty prompt after tokenization".to_string());
     }
-    if prompt_len > n_ctx as usize {
+    if prompt_len > ctx.n_ctx as usize {
         return Err(format!(
-            "Prompt {prompt_len} tokens exceeds n_ctx {n_ctx}"
+            "Prompt {prompt_len} tokens exceeds n_ctx {}",
+            ctx.n_ctx
         ));
     }
 
@@ -323,7 +240,7 @@ fn run_text_inference<'m>(
     // which is exactly what we want — divergence at the first image position.
     let new_entries: Vec<SlotEntry> = new_tokens.iter().map(|t| SlotEntry::Text(*t)).collect();
     let cached = {
-        let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+        let p = ensure_persistent_ctx(ctx.backend, ctx.model, ctx.n_ctx, ctx.kv_cache, persistent)?;
         get_common_prefix(&p.last_entries, &new_entries)
     };
 
@@ -332,8 +249,8 @@ fn run_text_inference<'m>(
     // gracefully handles trim-unsupported memories (recurrent/hybrid) by
     // restoring the closest checkpoint or fully clearing the cache.
     let phase1 = {
-        let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
-        prepare_prompt_decode(p, &new_tokens, cached, prompt_len, checkpoint_params)
+        let p = ensure_persistent_ctx(ctx.backend, ctx.model, ctx.n_ctx, ctx.kv_cache, persistent)?;
+        prepare_prompt_decode(p, &new_tokens, cached, prompt_len, ctx.checkpoint_params)
     };
 
     let (mut batch, effective_cached) = match phase1 {
@@ -347,8 +264,14 @@ fn run_text_inference<'m>(
             );
             *persistent = None;
             let retry = {
-                let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
-                prepare_prompt_decode(p, &new_tokens, 0, prompt_len, checkpoint_params)
+                let p = ensure_persistent_ctx(
+                    ctx.backend,
+                    ctx.model,
+                    ctx.n_ctx,
+                    ctx.kv_cache,
+                    persistent,
+                )?;
+                prepare_prompt_decode(p, &new_tokens, 0, prompt_len, ctx.checkpoint_params)
             };
             match retry {
                 Ok(out) => out,
@@ -367,13 +290,13 @@ fn run_text_inference<'m>(
     // Phase 2: commit the prompt to last_entries and sample. From this point on
     // we may have streamed tokens to the consumer, so any failure invalidates
     // the persistent slot but cannot be retried.
-    let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+    let p = ensure_persistent_ctx(ctx.backend, ctx.model, ctx.n_ctx, ctx.kv_cache, persistent)?;
     p.last_entries = new_entries;
     let prompt_tokens = prompt_len as u64;
     let cached_tokens = effective_cached as u64;
 
     let result = sample_tokens(
-        model,
+        ctx.model,
         &mut p.ctx,
         &mut batch,
         &prompt_build,

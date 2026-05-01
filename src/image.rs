@@ -2,9 +2,8 @@ use crate::checkpoint::{PersistentCtx, ensure_persistent_ctx};
 use crate::prompt::build_prompt;
 use crate::sampling::sample_tokens_from_pos;
 use crate::slot::{SlotEntry, get_common_prefix};
-use crate::types::{
-    InferenceParams, InferenceResult, KvCacheParams, PromptBuildResult, StreamSender,
-};
+use crate::types::{InferenceParams, InferenceResult, PromptBuildResult, StreamSender};
+use crate::worker::RunCtx;
 
 /// Multimodal (image) inference with the same persistent context the text
 /// path uses, plus image-aware prefix-cache reuse.
@@ -25,24 +24,21 @@ use crate::types::{
 ///   Image-suffix reuse via `mtmd_helper_eval_chunk_single` is not
 ///   implemented yet (the safe binding doesn't expose per-chunk eval).
 pub(crate) fn run_image_inference<'m>(
-    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
-    model: &'m llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
+    ctx: &RunCtx<'_, 'm>,
     persistent: &mut Option<PersistentCtx<'m>>,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
-    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
 ) -> Result<InferenceResult, String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
-    let prompt_build = build_prompt(model, &req.prepared_request)?;
+    let prompt_build = build_prompt(ctx.model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    // The worker dispatches here only when `mtmd_ctx.is_some()`, but return
-    // a typed error rather than panicking if a future refactor breaks that
-    // contract — the worker thread is the only one that can recover.
-    let mtmd = mtmd_ctx
+    // The worker dispatches here only when `ctx.mtmd_ctx.is_some()`, but
+    // return a typed error rather than panicking if a future refactor breaks
+    // that contract — the worker thread is the only one that can recover.
+    let mtmd = ctx
+        .mtmd_ctx
         .ok_or_else(|| "BUG: run_image_inference called without mtmd context".to_string())?;
 
     // Build bitmaps and stamp each with the FNV id so chunk ids round-trip.
@@ -79,13 +75,14 @@ pub(crate) fn run_image_inference<'m>(
     if prompt_len == 0 {
         return Err("Empty prompt after multimodal tokenization".to_string());
     }
-    if prompt_len > n_ctx as usize {
+    if prompt_len > ctx.n_ctx as usize {
         return Err(format!(
-            "Multimodal prompt {prompt_len} entries exceeds n_ctx {n_ctx}"
+            "Multimodal prompt {prompt_len} entries exceeds n_ctx {}",
+            ctx.n_ctx
         ));
     }
 
-    let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+    let p = ensure_persistent_ctx(ctx.backend, ctx.model, ctx.n_ctx, ctx.kv_cache, persistent)?;
 
     let cached_lcp = get_common_prefix(&p.last_entries, &new_entries);
     let suffix_has_image = new_entries[cached_lcp..]
@@ -144,7 +141,7 @@ pub(crate) fn run_image_inference<'m>(
                         .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
                         .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                     return finish_image_sample(
-                        model,
+                        ctx.model,
                         p,
                         new_entries,
                         prompt_tokens,
@@ -178,7 +175,7 @@ pub(crate) fn run_image_inference<'m>(
                             .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
                             .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                         return finish_image_sample(
-                            model,
+                            ctx.model,
                             p,
                             new_entries,
                             prompt_tokens,
@@ -243,7 +240,7 @@ pub(crate) fn run_image_inference<'m>(
     };
 
     finish_image_sample(
-        model,
+        ctx.model,
         p,
         new_entries,
         prompt_tokens,

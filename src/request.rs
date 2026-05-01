@@ -1,5 +1,6 @@
 use rig::completion::CompletionRequest;
 use rig::message::{AssistantContent, Message, ToolCall, UserContent};
+#[cfg(feature = "mtmd")]
 use rig::one_or_many::OneOrMany;
 use serde_json::{Value, json};
 
@@ -21,6 +22,10 @@ use crate::types::PreparedRequest;
 /// image content surfaces as `ToolResultContent::Image`. No-op for plain-text
 /// outputs: `from_tool_output` falls back to a single Text part on parse
 /// failure.
+///
+/// Only used by mtmd-aware code paths — without `mtmd` enabled, tool images
+/// can't be sent to the model anyway.
+#[cfg(feature = "mtmd")]
 fn normalized_tool_parts(
     content: &OneOrMany<rig::message::ToolResultContent>,
 ) -> Vec<rig::message::ToolResultContent> {

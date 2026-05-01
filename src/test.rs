@@ -5,9 +5,9 @@ use anyhow::{Context, ensure};
 use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
-use rig::message::{
-    AssistantContent, ImageMediaType, Message, ToolChoice, ToolResultContent, UserContent,
-};
+use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
+#[cfg(feature = "mtmd")]
+use rig::message::ImageMediaType;
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -49,6 +49,7 @@ impl fmt::Display for RunSummary {
     }
 }
 
+#[cfg(feature = "mtmd")]
 fn detect_image_media_type(path: &std::path::Path) -> ImageMediaType {
     match path
         .extension()

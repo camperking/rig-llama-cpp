@@ -51,6 +51,11 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Changed
 
+- Worker call chain refactored around a borrowed `RunCtx<'a, 'm>` and a
+  `WorkerInit<'a>` parameter struct, so internal functions stop tripping
+  clippy's `too_many_arguments` lint and stay readable as new fields
+  accrue. The `run_inference` / `run_inference_inner` cfg-arm shims
+  collapsed into a single dispatch function. No public-API impact.
 - Hardened the worker's persistent-context invariant. `ensure_persistent_ctx`
   now returns `Result<&mut PersistentCtx<'m>, String>` so the live reference
   flows out of the type system rather than via `Option::unwrap()` at five

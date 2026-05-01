@@ -14,7 +14,7 @@ use crate::types::{
     CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceRequest,
     KvCacheParams, RawResponse, ReloadRequest, ResponseChannel, SamplingParams, StreamChunk,
 };
-use crate::worker::inference_worker;
+use crate::worker::{WorkerInit, inference_worker};
 
 /// Default context window used by [`ClientBuilder`] when `n_ctx` is not set.
 const DEFAULT_N_CTX: u32 = 4096;
@@ -245,16 +245,15 @@ impl Client {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), LoadError>>();
 
         let worker_handle = thread::spawn(move || {
-            inference_worker(
-                &model_path,
-                mmproj_path.as_deref(),
+            let init = WorkerInit {
+                model_path: &model_path,
+                mmproj_path: mmproj_path.as_deref(),
                 n_ctx,
-                &fit_params,
-                &kv_cache_params,
+                fit_params: &fit_params,
+                kv_cache_params: &kv_cache_params,
                 checkpoint_params,
-                init_tx,
-                &mut request_rx,
-            );
+            };
+            inference_worker(init, init_tx, &mut request_rx);
         });
 
         init_rx
@@ -279,6 +278,10 @@ impl Client {
     /// Returns [`LoadError::WorkerNotRunning`] if the inference worker is no
     /// longer accepting commands, or any of the load-stage variants if the
     /// new model fails to come up.
+    // The positional signature is part of the 0.1.x public API. A future minor
+    // release can introduce a `ReloadOptions`/`reload_builder` shape; until
+    // then, the eight params (self + 7 fields) intentionally stay positional.
+    #[allow(clippy::too_many_arguments)]
     pub fn reload(
         &self,
         model_path: String,
