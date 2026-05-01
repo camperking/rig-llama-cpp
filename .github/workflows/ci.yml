@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [master]
+  # Pull requests are gated: a maintainer must add the `ci-ok` label to
+  # trigger CI. We listen on `labeled` to fire as soon as the gate opens,
+  # and on `synchronize` / `reopened` so subsequent pushes re-run CI while
+  # the label is still attached. `opened` is intentionally omitted so a
+  # fresh PR doesn't burn Actions minutes before review.
   pull_request:
+    types: [labeled, synchronize, reopened]
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,8 +31,15 @@ jobs:
   # default build is CPU-only, so a single ubuntu-latest run covers our
   # delta. Model-bearing tests are `#[ignore]` and require `MODEL_PATH`,
   # so they don't execute here (run them locally via `run_tests.sh`).
+  #
+  # The `if:` clause is the PR gate: pushes to master always run, but a
+  # `pull_request` event only runs once a maintainer has applied the
+  # `ci-ok` label. The `labeled`/`synchronize`/`reopened` triggers above
+  # only schedule the workflow; this conditional is what actually decides
+  # whether a job runs.
   check:
     name: check / clippy / test
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-ok')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +55,10 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # Both clippy runs are necessary: there are `#[cfg(not(feature =
+      # "mtmd"))]` branches in request.rs, loader.rs and client.rs that
+      # only compile when mtmd is off, so a single `--features mtmd` run
+      # would never typecheck them.
       - name: cargo clippy (default features)
         run: cargo clippy --no-deps --all-targets -- -D warnings
 
@@ -64,6 +81,7 @@ jobs:
   # already cover those in the `check` job above.
   msrv:
     name: msrv (rust-version from Cargo.toml)
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-ok')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
