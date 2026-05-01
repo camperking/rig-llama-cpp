@@ -20,7 +20,7 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-05-01
 
 Initial public release.
 
