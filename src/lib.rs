@@ -71,6 +71,10 @@ mod worker;
 mod parsing;
 mod prompt;
 mod sampling;
+mod loader;
+mod checkpoint;
+#[cfg(feature = "mtmd")]
+mod image;
 mod embedding;
 
 #[cfg(test)]
