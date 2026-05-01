@@ -8,6 +8,8 @@ A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF
 - Completion and streaming support
 - Tool calling (for models with OpenAI-compatible chat templates)
 - Reasoning / thinking output
+- Vision (multimodal) inference for models with an `mmproj` projector — opt in via the `mtmd` feature
+- Automatic GPU/CPU layer fitting — llama.cpp probes available device memory and picks `n_gpu_layers` for you, no manual tuning required
 - Backend selection via Cargo feature flags
 - Configurable sampling parameters (top-p, top-k, min-p, temperature, penalties)
 
