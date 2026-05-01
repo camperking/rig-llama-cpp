@@ -299,9 +299,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                     let content = normalized
                         .iter()
                         .filter_map(|part| match part {
-                            rig::message::ToolResultContent::Text(text) => {
-                                Some(text.text.as_str())
-                            }
+                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -312,9 +310,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                         .content
                         .iter()
                         .filter_map(|part| match part {
-                            rig::message::ToolResultContent::Text(text) => {
-                                Some(text.text.as_str())
-                            }
+                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -360,9 +356,8 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                 // markers in the rendered prompt.
                 #[cfg(feature = "mtmd")]
                 if pending_tool_image_count > 0 {
-                    let mut content_parts: Vec<Value> = Vec::with_capacity(
-                        pending_tool_image_count + 1,
-                    );
+                    let mut content_parts: Vec<Value> =
+                        Vec::with_capacity(pending_tool_image_count + 1);
                     content_parts.push(json!({
                         "type": "text",
                         "text": "Image(s) returned by the tool call above:",

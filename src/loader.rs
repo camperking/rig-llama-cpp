@@ -58,8 +58,8 @@ pub(crate) fn fit_and_load_model(
         .unwrap_or_else(|| vec![1 << 30; max_devices]);
     margins.resize(max_devices, 1 << 30);
 
-    let model_cstr = std::ffi::CString::new(model_path)
-        .map_err(|e| LoadError::InvalidPath(e.to_string()))?;
+    let model_cstr =
+        std::ffi::CString::new(model_path).map_err(|e| LoadError::InvalidPath(e.to_string()))?;
 
     // The C-side log level for `fit_params`. Routed via the
     // `RIG_LLAMA_CPP_LOGS` env var, not through the `log` facade, because

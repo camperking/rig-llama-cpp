@@ -163,59 +163,60 @@ pub(crate) fn run_image_inference<'m>(
 
         // If the entire prompt was already cached, roll back the last position
         // by one and re-decode it so the sampler has fresh logits.
-        let (start, suffix_tokens): (usize, Vec<llama_cpp_2::token::LlamaToken>) =
-            if cached_lcp >= prompt_len {
-                let last_idx = prompt_len - 1;
-                let token = match new_entries[last_idx] {
-                    SlotEntry::Text(t) => t,
-                    SlotEntry::Image { .. } => {
-                        // Last slot is an image — can't recompute with a text
-                        // batch. Fall through to a full re-eval.
-                        p.ctx.clear_kv_cache();
-                        p.last_entries.clear();
-                        p.clear_checkpoints();
-                        let n_past = chunks
-                            .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
-                            .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
-                        return finish_image_sample(
-                            ctx.model,
-                            p,
-                            new_entries,
-                            prompt_tokens,
-                            0,
-                            n_past as i32,
-                            &prompt_build,
-                            req,
-                            stream_tx,
-                            ctx.cancel,
-                        );
-                    }
-                };
-                let removed = p
-                    .ctx
-                    .clear_kv_cache_seq(Some(0), Some(last_idx as u32), None)
-                    .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
-                if !removed {
-                    return Err(format!(
-                        "KV cache trim (rollback) returned false at pos {last_idx}"
-                    ));
+        let (start, suffix_tokens): (usize, Vec<llama_cpp_2::token::LlamaToken>) = if cached_lcp
+            >= prompt_len
+        {
+            let last_idx = prompt_len - 1;
+            let token = match new_entries[last_idx] {
+                SlotEntry::Text(t) => t,
+                SlotEntry::Image { .. } => {
+                    // Last slot is an image — can't recompute with a text
+                    // batch. Fall through to a full re-eval.
+                    p.ctx.clear_kv_cache();
+                    p.last_entries.clear();
+                    p.clear_checkpoints();
+                    let n_past = chunks
+                        .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
+                        .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
+                    return finish_image_sample(
+                        ctx.model,
+                        p,
+                        new_entries,
+                        prompt_tokens,
+                        0,
+                        n_past as i32,
+                        &prompt_build,
+                        req,
+                        stream_tx,
+                        ctx.cancel,
+                    );
                 }
-                p.last_entries.truncate(last_idx);
-                (last_idx, vec![token])
-            } else {
-                let mut tokens = Vec::with_capacity(prompt_len - cached_lcp);
-                for entry in &new_entries[cached_lcp..] {
-                    match entry {
-                        SlotEntry::Text(t) => tokens.push(*t),
-                        SlotEntry::Image { .. } => {
-                            unreachable!(
-                                "suffix_has_image guard should have routed image suffix to full re-eval"
-                            )
-                        }
-                    }
-                }
-                (cached_lcp, tokens)
             };
+            let removed = p
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(last_idx as u32), None)
+                .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+            if !removed {
+                return Err(format!(
+                    "KV cache trim (rollback) returned false at pos {last_idx}"
+                ));
+            }
+            p.last_entries.truncate(last_idx);
+            (last_idx, vec![token])
+        } else {
+            let mut tokens = Vec::with_capacity(prompt_len - cached_lcp);
+            for entry in &new_entries[cached_lcp..] {
+                match entry {
+                    SlotEntry::Text(t) => tokens.push(*t),
+                    SlotEntry::Image { .. } => {
+                        unreachable!(
+                            "suffix_has_image guard should have routed image suffix to full re-eval"
+                        )
+                    }
+                }
+            }
+            (cached_lcp, tokens)
+        };
 
         let prompt_batch_limit = p.ctx.n_batch().max(1) as usize;
         let mut batch = LlamaBatch::new(prompt_batch_limit, 1);

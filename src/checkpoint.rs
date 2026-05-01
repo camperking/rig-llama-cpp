@@ -166,9 +166,7 @@ pub(crate) fn restore_or_clear(p: &mut PersistentCtx<'_>, cached: usize) -> usiz
             // just rolled past).
             p.checkpoints.truncate(idx + 1);
 
-            log::debug!(
-                "restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})"
-            );
+            log::debug!("restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})");
             return n_tokens;
         }
 
@@ -202,8 +200,8 @@ pub(crate) fn maybe_create_checkpoint(
     let n_ubatch = p.ctx.n_ubatch().max(1) as usize;
     // Same offsets as llama-server: 4 + n_ubatch and 4 tokens before the end
     // of the prompt.
-    let near_end = n_tokens_decoded + 4 + n_ubatch == prompt_len
-        || n_tokens_decoded + 4 == prompt_len;
+    let near_end =
+        n_tokens_decoded + 4 + n_ubatch == prompt_len || n_tokens_decoded + 4 == prompt_len;
 
     let last_n_tokens = p.checkpoints.back().map(|c| c.n_tokens).unwrap_or(0);
     let cadence_ok = params.every_n_tokens > 0
@@ -212,17 +210,17 @@ pub(crate) fn maybe_create_checkpoint(
     if !(near_end || cadence_ok) {
         return;
     }
-    if p
-        .checkpoints
+    if p.checkpoints
         .back()
         .is_some_and(|c| n_tokens_decoded.saturating_sub(c.n_tokens) < params.min_gap as usize)
     {
         return;
     }
 
-    let size = p
-        .ctx
-        .state_seq_get_size_ext(0, llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY);
+    let size = p.ctx.state_seq_get_size_ext(
+        0,
+        llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY,
+    );
     if size == 0 {
         return;
     }

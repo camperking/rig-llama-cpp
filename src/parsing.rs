@@ -12,10 +12,7 @@ impl StreamDeltaState {
         }
     }
 
-    pub(crate) fn parse_delta(
-        &mut self,
-        delta_json: &str,
-    ) -> Vec<RawStreamingChoice<StreamChunk>> {
+    pub(crate) fn parse_delta(&mut self, delta_json: &str) -> Vec<RawStreamingChoice<StreamChunk>> {
         let mut choices = Vec::new();
         let Ok(value) = serde_json::from_str::<Value>(delta_json) else {
             return choices;
@@ -269,9 +266,7 @@ pub(crate) fn parse_completion_output(
     // a valid JSON object — but chat templates often wrap it in role tokens
     // (e.g. `<|im_start|>assistant\n`) or markdown fences (```json ... ```).
     // Strip those before any other parsing so Rig's typed prompt can deserialize.
-    if has_json_schema
-        && let Some(json) = extract_structured_json(raw_text)
-    {
+    if has_json_schema && let Some(json) = extract_structured_json(raw_text) {
         return Ok(OneOrMany::one(AssistantContent::text(json)));
     }
 

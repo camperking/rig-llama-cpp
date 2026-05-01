@@ -242,7 +242,10 @@ pub(crate) fn sample_tokens_from_pos(
         completion_tokens += 1;
 
         // Check for additional stop sequences
-        if let Some(stop) = additional_stops.iter().find(|s| output.ends_with(s.as_str())) {
+        if let Some(stop) = additional_stops
+            .iter()
+            .find(|s| output.ends_with(s.as_str()))
+        {
             let stop_len = stop.len();
             output.truncate(output.len() - stop_len);
             break;
@@ -380,7 +383,10 @@ pub(crate) fn sample_tokens(
         completion_tokens += 1;
 
         // Check for additional stop sequences
-        if let Some(stop) = additional_stops.iter().find(|s| output.ends_with(s.as_str())) {
+        if let Some(stop) = additional_stops
+            .iter()
+            .find(|s| output.ends_with(s.as_str()))
+        {
             let stop_len = stop.len();
             output.truncate(output.len() - stop_len);
             break;

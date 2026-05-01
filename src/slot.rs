@@ -16,7 +16,10 @@ pub(crate) enum SlotEntry {
     /// `group_id` ties together the consecutive entries that belong to the
     /// same image so the matcher can detect partial-overlap mismatches.
     #[cfg_attr(not(feature = "mtmd"), allow(dead_code))]
-    Image { hash: u64, group_id: u32 },
+    Image {
+        hash: u64,
+        group_id: u32,
+    },
 }
 
 /// Length of the longest common prefix of `cur` and `new`.
@@ -61,7 +64,10 @@ fn group_run_len(entries: &[SlotEntry], start: usize, hash: u64, group_id: u32) 
     let mut len = 0;
     while start + len < entries.len() {
         match entries[start + len] {
-            SlotEntry::Image { hash: h, group_id: g } if h == hash && g == group_id => {
+            SlotEntry::Image {
+                hash: h,
+                group_id: g,
+            } if h == hash && g == group_id => {
                 len += 1;
             }
             _ => break,

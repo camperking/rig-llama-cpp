@@ -64,31 +64,31 @@
 //! # }
 //! ```
 
-mod types;
-mod client;
-mod error;
-mod request;
-mod slot;
-mod worker;
-mod parsing;
-mod prompt;
-mod sampling;
-mod loader;
 mod checkpoint;
+mod client;
+mod embedding;
+mod error;
 #[cfg(feature = "mtmd")]
 mod image;
-mod embedding;
+mod loader;
+mod parsing;
+mod prompt;
+mod request;
+mod sampling;
+mod slot;
+mod types;
+mod worker;
 
 #[cfg(test)]
 mod test;
 
-pub use types::{
-    CheckpointParams, FitParams, KvCacheParams, RawResponse, SamplingParams, StreamChunk,
-};
-pub use llama_cpp_2::context::params::KvCacheType;
 pub use client::{Client, ClientBuilder, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
 pub use error::LoadError;
+pub use llama_cpp_2::context::params::KvCacheType;
+pub use types::{
+    CheckpointParams, FitParams, KvCacheParams, RawResponse, SamplingParams, StreamChunk,
+};
 
 fn env_flag_enabled(name: &str) -> bool {
     match std::env::var(name) {
@@ -122,8 +122,8 @@ fn llama_logs_enabled() -> bool {
 /// calls are cheap (single `OnceLock::get`). On platforms where init can
 /// fail (e.g. no Vulkan device) the error is sticky for the lifetime of
 /// the process — there's no recovering anyway.
-pub(crate) fn shared_backend()
--> Result<&'static llama_cpp_2::llama_backend::LlamaBackend, String> {
+pub(crate) fn shared_backend() -> Result<&'static llama_cpp_2::llama_backend::LlamaBackend, String>
+{
     use llama_cpp_2::llama_backend::LlamaBackend;
     use std::sync::{Mutex, OnceLock};
 
@@ -142,8 +142,7 @@ pub(crate) fn shared_backend()
         return Ok(b);
     }
 
-    let mut backend =
-        LlamaBackend::init().map_err(|e| format!("Backend init failed: {e}"))?;
+    let mut backend = LlamaBackend::init().map_err(|e| format!("Backend init failed: {e}"))?;
     if !llama_logs_enabled() {
         backend.void_logs();
         // NOTE: upstream llama-cpp-2 0.1.146 does not yet expose a way to

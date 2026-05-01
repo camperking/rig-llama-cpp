@@ -5,9 +5,9 @@ use anyhow::{Context, ensure};
 use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
-use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
 #[cfg(feature = "mtmd")]
 use rig::message::ImageMediaType;
+use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -805,8 +805,14 @@ async fn qwen_thinking() -> anyhow::Result<()> {
     )
     .await?;
 
-    println!("qwen_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}", raw.len());
-    ensure!(has_reasoning, "Qwen should produce reasoning content with thinking enabled");
+    println!(
+        "qwen_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}",
+        raw.len()
+    );
+    ensure!(
+        has_reasoning,
+        "Qwen should produce reasoning content with thinking enabled"
+    );
     Ok(())
 }
 
@@ -816,7 +822,10 @@ async fn qwen_tool_roundtrip() -> anyhow::Result<()> {
     let (_client, model) = load_model("./Qwen3.5-2B-Q4_K_M.gguf")?;
     let (tool_name, follow_up) = tool_roundtrip(&model).await?;
 
-    println!("qwen_tool_roundtrip: called={tool_name}, follow_up_len={}", follow_up.len());
+    println!(
+        "qwen_tool_roundtrip: called={tool_name}, follow_up_len={}",
+        follow_up.len()
+    );
     ensure!(
         tool_name == "get_time",
         "Qwen called wrong tool: {tool_name}"
@@ -855,7 +864,10 @@ async fn qwen_structured_output() -> anyhow::Result<()> {
         "qwen_structured_output: name={}, age={}, occupation={}",
         person.name, person.age, person.occupation
     );
-    ensure!(!person.name.is_empty(), "Qwen structured output: name was empty");
+    ensure!(
+        !person.name.is_empty(),
+        "Qwen structured output: name was empty"
+    );
     ensure!(person.age > 0, "Qwen structured output: age was zero");
     ensure!(
         !person.occupation.is_empty(),
@@ -877,8 +889,14 @@ async fn gemma_thinking() -> anyhow::Result<()> {
     )
     .await?;
 
-    println!("gemma_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}", raw.len());
-    ensure!(has_reasoning, "Gemma-4 should produce reasoning content with thinking enabled");
+    println!(
+        "gemma_thinking: reasoning={has_reasoning}, text={has_text}, raw_len={}",
+        raw.len()
+    );
+    ensure!(
+        has_reasoning,
+        "Gemma-4 should produce reasoning content with thinking enabled"
+    );
     Ok(())
 }
 
@@ -901,7 +919,10 @@ async fn gemma_structured_output() -> anyhow::Result<()> {
         "gemma_structured_output: name={}, age={}, occupation={}",
         person.name, person.age, person.occupation
     );
-    ensure!(!person.name.is_empty(), "Gemma structured output: name was empty");
+    ensure!(
+        !person.name.is_empty(),
+        "Gemma structured output: name was empty"
+    );
     ensure!(person.age > 0, "Gemma structured output: age was zero");
     ensure!(
         !person.occupation.is_empty(),
@@ -916,7 +937,10 @@ async fn gemma_tool_roundtrip() -> anyhow::Result<()> {
     let (_client, model) = load_model("./gemma-4-E4B-it-Q4_K_M.gguf")?;
     let (tool_name, follow_up) = tool_roundtrip(&model).await?;
 
-    println!("gemma_tool_roundtrip: called={tool_name}, follow_up_len={}", follow_up.len());
+    println!(
+        "gemma_tool_roundtrip: called={tool_name}, follow_up_len={}",
+        follow_up.len()
+    );
     ensure!(
         tool_name == "get_time",
         "Gemma-4 called wrong tool: {tool_name}"

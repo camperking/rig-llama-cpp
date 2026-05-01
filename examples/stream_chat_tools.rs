@@ -2,7 +2,7 @@ use rig::agent::MultiTurnStreamItem;
 use rig::client::CompletionClient;
 use rig::completion::ToolDefinition;
 use rig::message::Message;
-use rig::streaming::{StreamedAssistantContent, StreamingChat, StreamedUserContent};
+use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use rig::tool::{Tool, ToolDyn};
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde::{Deserialize, Serialize};
@@ -108,9 +108,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 print!("[think]{}[/think]", reasoning);
                 std::io::Write::flush(&mut std::io::stdout()).ok();
             }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ToolCall { tool_call, .. },
-            )) => {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                tool_call,
+                ..
+            })) => {
                 tool_call_count += 1;
                 println!(
                     "\n[TOOL_CALL #{}] name={} id={} args={}",
