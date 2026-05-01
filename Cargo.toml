@@ -17,7 +17,10 @@ features = ["mtmd"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["vulkan"]
+# No default backend: pick exactly the one that matches your hardware. CPU-only
+# (no GPU feature) works out of the box; add `openmp` to opt into OpenMP
+# threading.
+default = []
 openmp = ["llama-cpp-2/openmp"]
 vulkan = ["llama-cpp-2/vulkan"]
 cuda = ["llama-cpp-2/cuda"]

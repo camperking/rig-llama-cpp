@@ -161,9 +161,10 @@ impl Default for SamplingParams {
 
 /// Configuration for automatic GPU/CPU layer fitting.
 ///
-/// When used with [`Client::from_gguf_with_fit`], llama.cpp will automatically
-/// determine the optimal number of layers to offload to GPU based on available VRAM,
-/// instead of requiring a manual `n_gpu_layers` value.
+/// Passed to [`crate::Client::builder`] (or [`crate::Client::from_gguf`]) so
+/// llama.cpp can probe available device memory and pick the optimal number
+/// of layers to offload to GPU automatically, instead of requiring a manual
+/// `n_gpu_layers` value.
 #[derive(Clone, Debug)]
 pub struct FitParams {
     /// Memory margin per device in bytes. If `None`, defaults to 1 GiB per device.

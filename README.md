@@ -13,29 +13,37 @@ A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF
 
 ## Feature Flags
 
-This crate forwards backend feature flags to `llama-cpp-2`.
+There is **no default GPU backend** — `cargo add rig-llama-cpp` gives you a
+CPU-only build. Pick exactly the backend that matches your hardware:
 
-- `vulkan` (default)
-- `cuda`
-- `metal`
-- `rocm`
-- `openmp`
+| Feature  | When to pick it                                                      | Build-time requirements                       |
+| -------- | -------------------------------------------------------------------- | --------------------------------------------- |
+| _(none)_ | CPU-only inference                                                   | C/C++ toolchain                               |
+| `vulkan` | Cross-vendor GPU on Linux/Windows; default for AMD without ROCm      | Vulkan SDK or `libvulkan` + working ICD       |
+| `cuda`   | NVIDIA GPUs                                                          | CUDA toolkit, matching driver                 |
+| `metal`  | Apple Silicon / macOS                                                | Xcode command-line tools                      |
+| `rocm`   | AMD GPUs on Linux                                                    | ROCm toolchain                                |
+| `openmp` | OpenMP CPU threading; orthogonal — combine with any GPU backend      | OpenMP runtime (libgomp / libomp)             |
+| `mtmd`   | Multimodal (vision) inference; enables `ClientBuilder::mmproj` etc.  | (none beyond the chosen backend)              |
 
 Examples:
 
 ```sh
-# Default build (Vulkan)
+# CPU-only
 cargo build
 
-# CUDA build
-cargo build --no-default-features --features cuda
+# Vulkan
+cargo build --features vulkan
 
-# ROCm build
-cargo build --no-default-features --features rocm
+# CUDA + multimodal
+cargo build --features "cuda,mtmd"
+
+# CPU + OpenMP threading
+cargo build --features openmp
 ```
 
-Backend support depends on the corresponding `llama-cpp-2` feature and any required
-native toolchain or system libraries being available on the host machine.
+Backend support also depends on the corresponding `llama-cpp-2` feature and the
+host machine actually having the listed runtime libraries available.
 
 ## Usage
 

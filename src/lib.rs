@@ -3,7 +3,7 @@
 //! A [Rig](https://docs.rs/rig-core) provider that runs GGUF models locally
 //! via [llama.cpp](https://github.com/ggml-org/llama.cpp), with optional Vulkan GPU acceleration.
 //!
-//! This crate implements Rig's [`CompletionModel`] and [`rig::embeddings::EmbeddingModel`] traits
+//! This crate implements Rig's [`rig::completion::CompletionModel`] and [`rig::embeddings::EmbeddingModel`] traits
 //! so that any GGUF model can be used as a drop-in replacement for cloud-based providers. It supports:
 //!
 //! - **Completion and streaming** — both one-shot and token-by-token responses.
@@ -14,20 +14,27 @@
 //!
 //! # Feature flags
 //!
-//! This crate forwards backend feature flags to `llama-cpp-2`.
+//! There is **no default GPU backend** — pick exactly the one that matches
+//! your hardware. With no feature enabled the build is CPU-only.
 //!
-//! - `vulkan` (default)
-//! - `cuda`
-//! - `metal`
-//! - `rocm`
-//! - `openmp`
+//! GPU backends (forwarded to `llama-cpp-2`):
+//!
+//! - `vulkan` — cross-vendor GPU (recommended on Linux/Windows when CUDA/ROCm aren't set up).
+//! - `cuda` — NVIDIA GPUs with the CUDA toolkit installed.
+//! - `metal` — Apple Silicon / macOS.
+//! - `rocm` — AMD GPUs on Linux with the ROCm toolchain.
+//!
+//! Other:
+//!
+//! - `openmp` — OpenMP CPU threading; orthogonal to the GPU backends and may be combined with any of them.
+//! - `mtmd` — multimodal (vision) inference; required for `Client::from_gguf_with_mmproj` and `ClientBuilder::mmproj`.
 //!
 //! Examples:
 //!
 //! ```text
-//! cargo build
-//! cargo build --no-default-features --features cuda
-//! cargo build --no-default-features --features rocm
+//! cargo build --features vulkan
+//! cargo build --features cuda
+//! cargo build --features "vulkan,mtmd"
 //! ```
 //!
 //! Backend support depends on the corresponding `llama-cpp-2` feature and any required
@@ -79,7 +86,7 @@ pub use types::{
     CheckpointParams, FitParams, KvCacheParams, RawResponse, SamplingParams, StreamChunk,
 };
 pub use llama_cpp_2::context::params::KvCacheType;
-pub use client::{Client, Model};
+pub use client::{Client, ClientBuilder, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
 pub use error::LoadError;
 

@@ -43,6 +43,17 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Changed
 
+- **BREAKING (build-time):** the `vulkan` Cargo feature is no longer a
+  default. Pick a backend explicitly with `--features vulkan` (or `cuda`,
+  `metal`, `rocm`); with no backend feature you get a CPU-only build that
+  works on any host. Downstream callers that already pass
+  `default-features = false` (e.g. the Chatty parent crate) are
+  unaffected.
+- Re-exported `ClientBuilder` from the crate root so its rustdoc renders
+  on docs.rs.
+- Cleaned up stale rustdoc intra-doc links (`Client::from_gguf_with_fit`,
+  bare `CompletionModel`) so `cargo doc` is warning-free both with and
+  without the `mtmd` feature.
 - `anyhow` is no longer a direct dependency; it is dev-only (used by the
   examples). Doctests use `Box<dyn std::error::Error>`.
 
