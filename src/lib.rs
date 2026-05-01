@@ -69,6 +69,8 @@ mod request;
 mod slot;
 mod worker;
 mod parsing;
+mod prompt;
+mod sampling;
 mod embedding;
 
 #[cfg(test)]
