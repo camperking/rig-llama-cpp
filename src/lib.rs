@@ -136,8 +136,10 @@ pub(crate) fn shared_backend()
         LlamaBackend::init().map_err(|e| format!("Backend init failed: {e}"))?;
     if !llama_logs_enabled() {
         backend.void_logs();
-        #[cfg(feature = "mtmd")]
-        llama_cpp_2::mtmd::void_mtmd_logs();
+        // NOTE: upstream llama-cpp-2 0.1.146 does not yet expose a way to
+        // silence mtmd's own log stream — when the `mtmd` feature is on,
+        // mmproj init may print to stderr. Track upstream for an mtmd
+        // log-silencing API and re-enable suppression here.
     }
     let _ = BACKEND.set(backend);
     Ok(BACKEND.get().expect("backend just set"))

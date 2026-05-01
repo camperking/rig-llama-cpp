@@ -18,9 +18,11 @@ pub(crate) fn fit_and_load_model(
     kv_cache: &KvCacheParams,
     logs_enabled: bool,
 ) -> Result<WorkerModel, String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::list_llama_ggml_backend_devices;
     use llama_cpp_2::model::LlamaModel as LlamaCppModel;
     use llama_cpp_2::model::params::LlamaModelParams;
+    use std::num::NonZeroU32;
     use std::pin::pin;
 
     // Do NOT call with_n_gpu_layers — fit requires n_gpu_layers at default (-1)
@@ -45,9 +47,9 @@ pub(crate) fn fit_and_load_model(
 
     let mut pinned_params = pin!(model_params);
 
-    // Prepare raw context params for the fit call
-    let mut cparams = unsafe { llama_cpp_sys_2::llama_context_default_params() };
-    cparams.n_ctx = n_ctx;
+    // Context params for the fit call. `n_ctx` is left as the user's request;
+    // `fit_params` only auto-selects when `n_ctx == 0`.
+    let mut cparams = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
 
     // Prepare margins
     let max_devices = unsafe { llama_cpp_sys_2::llama_max_devices() };
