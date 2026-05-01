@@ -1,6 +1,6 @@
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, KvCacheType, SamplingParams};
+use rig_llama_cpp::{Client, KvCacheParams, KvCacheType};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -9,19 +9,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Quantize both K and V caches to Q8_0 to roughly halve KV-cache VRAM usage
     // at long `n_ctx`, at a small accuracy cost. Try `Q4_0` for ~1/4 VRAM.
-    let kv_cache = KvCacheParams {
-        type_k: KvCacheType::Q8_0,
-        type_v: KvCacheType::Q8_0,
-    };
+    let kv_cache = KvCacheParams::default()
+        .with_type_k(KvCacheType::Q8_0)
+        .with_type_v(KvCacheType::Q8_0);
 
-    let client = Client::from_gguf(
-        &model_path,
-        32_768,
-        SamplingParams::default(),
-        FitParams::default(),
-        kv_cache,
-        CheckpointParams::default(),
-    )?;
+    let client = Client::builder(&model_path)
+        .n_ctx(32_768)
+        .kv_cache(kv_cache)
+        .build()?;
 
     let response = client
         .agent("local")

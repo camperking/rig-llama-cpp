@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 /// Raw completion response returned by the model.
+///
+/// Marked `#[non_exhaustive]` because new fields may be added in future
+/// minor releases.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RawResponse {
     /// The full generated text.
     pub text: String,
@@ -16,8 +20,11 @@ pub struct RawResponse {
 
 /// A single chunk emitted during streaming inference.
 ///
-/// The final chunk in a stream includes token usage counts.
+/// The final chunk in a stream includes token usage counts. Marked
+/// `#[non_exhaustive]` because new fields may be added in future minor
+/// releases.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamChunk {
     /// The text fragment for this chunk.
     pub text: String,
@@ -123,17 +130,17 @@ pub(crate) struct PromptBuildResult {
 
 /// Sampling parameters that control token generation.
 ///
-/// Use `Default::default()` for reasonable starting values, then override
-/// individual fields as needed.
+/// Marked `#[non_exhaustive]` so future sampling knobs can be added without
+/// a breaking release. Start from [`SamplingParams::default`] and chain
+/// `with_*` setters:
 ///
 /// ```
-/// let params = rig_llama_cpp::SamplingParams {
-///     top_k: 40,
-///     presence_penalty: 1.5,
-///     ..Default::default()
-/// };
+/// let params = rig_llama_cpp::SamplingParams::default()
+///     .with_top_k(40)
+///     .with_presence_penalty(1.5);
 /// ```
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SamplingParams {
     /// Nucleus sampling threshold (default: `0.95`).
     pub top_p: f32,
@@ -159,13 +166,54 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    /// Set the nucleus sampling threshold.
+    #[must_use]
+    pub fn with_top_p(mut self, top_p: f32) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    /// Set the top-k sampling parameter.
+    #[must_use]
+    pub fn with_top_k(mut self, top_k: i32) -> Self {
+        self.top_k = top_k;
+        self
+    }
+
+    /// Set the minimum probability threshold.
+    #[must_use]
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
+        self
+    }
+
+    /// Set the presence penalty.
+    #[must_use]
+    pub fn with_presence_penalty(mut self, presence_penalty: f32) -> Self {
+        self.presence_penalty = presence_penalty;
+        self
+    }
+
+    /// Set the repetition penalty.
+    #[must_use]
+    pub fn with_repetition_penalty(mut self, repetition_penalty: f32) -> Self {
+        self.repetition_penalty = repetition_penalty;
+        self
+    }
+}
+
 /// Configuration for automatic GPU/CPU layer fitting.
 ///
 /// Passed to [`crate::Client::builder`] (or [`crate::Client::from_gguf`]) so
 /// llama.cpp can probe available device memory and pick the optimal number
 /// of layers to offload to GPU automatically, instead of requiring a manual
 /// `n_gpu_layers` value.
+///
+/// Marked `#[non_exhaustive]`; build via `Default::default()` and chain the
+/// `with_*` setters.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FitParams {
     /// Memory margin per device in bytes. If `None`, defaults to 1 GiB per device.
     pub margins: Option<Vec<usize>>,
@@ -179,6 +227,22 @@ impl Default for FitParams {
             margins: None,
             n_ctx_min: 4096,
         }
+    }
+}
+
+impl FitParams {
+    /// Override the per-device memory margin in bytes.
+    #[must_use]
+    pub fn with_margins(mut self, margins: Option<Vec<usize>>) -> Self {
+        self.margins = margins;
+        self
+    }
+
+    /// Override the minimum context size to preserve during fitting.
+    #[must_use]
+    pub fn with_n_ctx_min(mut self, n_ctx_min: u32) -> Self {
+        self.n_ctx_min = n_ctx_min;
+        self
     }
 }
 
@@ -197,7 +261,11 @@ impl Default for FitParams {
 /// For non-hybrid models (Qwen 2.5, Llama 3, Gemma, ...) checkpoints are
 /// created but never used because the cheaper partial-trim path
 /// succeeds.
+///
+/// Marked `#[non_exhaustive]`; build via `Default::default()` and chain the
+/// `with_*` setters.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct CheckpointParams {
     /// Maximum number of checkpoints retained per persistent context.
     /// `0` disables checkpointing entirely. Each checkpoint is a few MB
@@ -229,6 +297,36 @@ impl Default for CheckpointParams {
     }
 }
 
+impl CheckpointParams {
+    /// Override the maximum number of checkpoints retained per context.
+    #[must_use]
+    pub fn with_max_checkpoints(mut self, max_checkpoints: u32) -> Self {
+        self.max_checkpoints = max_checkpoints;
+        self
+    }
+
+    /// Override the approximate spacing between checkpoints (in tokens).
+    #[must_use]
+    pub fn with_every_n_tokens(mut self, every_n_tokens: i32) -> Self {
+        self.every_n_tokens = every_n_tokens;
+        self
+    }
+
+    /// Override the minimum prompt length before checkpoints are taken.
+    #[must_use]
+    pub fn with_min_tokens(mut self, min_tokens: u32) -> Self {
+        self.min_tokens = min_tokens;
+        self
+    }
+
+    /// Override the minimum spacing between two consecutive checkpoints.
+    #[must_use]
+    pub fn with_min_gap(mut self, min_gap: u32) -> Self {
+        self.min_gap = min_gap;
+        self
+    }
+}
+
 /// KV cache quantization configuration.
 ///
 /// Controls the data type used for the attention K and V caches. llama.cpp defaults
@@ -237,15 +335,18 @@ impl Default for CheckpointParams {
 /// amount of accuracy for a large reduction in VRAM usage, which is often the dominant
 /// cost at long `n_ctx`.
 ///
+/// Marked `#[non_exhaustive]`; build via `Default::default()` and chain the
+/// `with_*` setters:
+///
 /// ```
 /// use rig_llama_cpp::{KvCacheParams, KvCacheType};
 ///
-/// let kv = KvCacheParams {
-///     type_k: KvCacheType::Q8_0,
-///     type_v: KvCacheType::Q8_0,
-/// };
+/// let kv = KvCacheParams::default()
+///     .with_type_k(KvCacheType::Q8_0)
+///     .with_type_v(KvCacheType::Q8_0);
 /// ```
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct KvCacheParams {
     /// Data type for the K cache (default: `KvCacheType::F16`).
     pub type_k: llama_cpp_2::context::params::KvCacheType,
@@ -259,6 +360,22 @@ impl Default for KvCacheParams {
             type_k: llama_cpp_2::context::params::KvCacheType::F16,
             type_v: llama_cpp_2::context::params::KvCacheType::F16,
         }
+    }
+}
+
+impl KvCacheParams {
+    /// Override the K cache data type.
+    #[must_use]
+    pub fn with_type_k(mut self, type_k: llama_cpp_2::context::params::KvCacheType) -> Self {
+        self.type_k = type_k;
+        self
+    }
+
+    /// Override the V cache data type.
+    #[must_use]
+    pub fn with_type_v(mut self, type_v: llama_cpp_2::context::params::KvCacheType) -> Self {
+        self.type_v = type_v;
+        self
     }
 }
 

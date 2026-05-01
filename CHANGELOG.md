@@ -27,6 +27,10 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Added
 
+- `with_*` setters (chainable, `#[must_use]`) on `SamplingParams`,
+  `FitParams`, `KvCacheParams`, and `CheckpointParams`. External callers
+  should now build these via `Default::default().with_x(...)` instead of
+  struct-literal syntax.
 - `Client::builder(model_path)` returns a `ClientBuilder` with `.n_ctx`,
   `.sampling`, `.fit`, `.kv_cache`, `.checkpoints`, and `.mmproj` (mtmd-only)
   setters. Defaults to `n_ctx = 4096` plus `Default::default()` for every
@@ -49,6 +53,12 @@ rather than caret-resolving across `0.x` boundaries.
   works on any host. Downstream callers that already pass
   `default-features = false` (e.g. the Chatty parent crate) are
   unaffected.
+- **BREAKING (source):** `SamplingParams`, `FitParams`, `KvCacheParams`,
+  `CheckpointParams`, `RawResponse`, and `StreamChunk` are now
+  `#[non_exhaustive]`. External crates can no longer construct them via
+  struct-literal syntax; use `Default::default()` plus the new `with_*`
+  setters on the parameter structs. Future fields can now be added in a
+  minor release.
 - Re-exported `ClientBuilder` from the crate root so its rustdoc renders
   on docs.rs.
 - Cleaned up stale rustdoc intra-doc links (`Client::from_gguf_with_fit`,
