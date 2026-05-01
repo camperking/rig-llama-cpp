@@ -100,8 +100,8 @@ pub(crate) fn ensure_persistent_ctx<'a, 'm>(
     if persistent.is_none() {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_type_k(kv_cache.type_k)
-            .with_type_v(kv_cache.type_v);
+            .with_type_k(kv_cache.type_k.into())
+            .with_type_v(kv_cache.type_v.into());
         let ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| format!("Context creation failed: {e}"))?;

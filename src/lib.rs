@@ -85,9 +85,9 @@ mod test;
 pub use client::{Client, ClientBuilder, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
 pub use error::LoadError;
-pub use llama_cpp_2::context::params::KvCacheType;
 pub use types::{
-    CheckpointParams, FitParams, KvCacheParams, RawResponse, SamplingParams, StreamChunk,
+    CheckpointParams, FitParams, KvCacheParams, KvCacheType, RawResponse, SamplingParams,
+    StreamChunk,
 };
 
 fn env_flag_enabled(name: &str) -> bool {

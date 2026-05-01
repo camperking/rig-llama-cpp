@@ -14,14 +14,11 @@ While the crate is on `0.x`:
 - A bump to `0.x.Z` (e.g. `0.1.0` → `0.1.1`) is reserved for additive or
   non-breaking changes.
 
-### Caveat — re-exported `llama-cpp-2` types
-
-This crate re-exports `llama_cpp_2::context::params::KvCacheType` (and may add
-more upstream types over time). A breaking change in `llama-cpp-2` therefore
-forces a breaking release of `rig-llama-cpp`, even when our own surface area
-is unchanged. We aim to absorb upstream churn behind shim types where it is
-cheap, but consumers should pin minor versions (e.g. `rig-llama-cpp = "0.1"`)
-rather than caret-resolving across `0.x` boundaries.
+The public surface is fully owned by this crate — `KvCacheType`, the
+parameter structs, and `LoadError` are all defined here, not re-exported
+from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
+`0.1.x` change here (we add a corresponding shim variant), not a breaking
+release.
 
 ## [0.1.0] — unreleased
 

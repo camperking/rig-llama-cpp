@@ -327,6 +327,127 @@ impl CheckpointParams {
     }
 }
 
+/// Data type used for an entry in the attention KV cache.
+///
+/// Mirrors the subset of `ggml_type` values that `llama.cpp` accepts as KV
+/// cache element types. The `F16` default preserves full attention quality;
+/// quantizing (e.g. `Q8_0` ≈ ½ size, `Q4_0` ≈ ¼ size) trades a small amount
+/// of accuracy for a large VRAM reduction at long `n_ctx`.
+///
+/// This is a local shim around `llama_cpp_2::context::params::KvCacheType`
+/// so a future `llama-cpp-2` update doesn't force a breaking release of
+/// `rig-llama-cpp`. Marked `#[non_exhaustive]`: when llama.cpp adds a new
+/// `ggml_type`, we add a corresponding variant in a minor (`0.1.x`) release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+#[non_exhaustive]
+pub enum KvCacheType {
+    /// IEEE 754 single precision.
+    F32,
+    /// IEEE 754 half precision (llama.cpp's default for both K and V).
+    F16,
+    /// Brain floating-point 16, common on newer NVIDIA / AMD GPUs.
+    BF16,
+    /// IEEE 754 double precision.
+    F64,
+    /// 4-bit block quantization, type 0.
+    Q4_0,
+    /// 4-bit block quantization, type 1.
+    Q4_1,
+    /// 5-bit block quantization, type 0.
+    Q5_0,
+    /// 5-bit block quantization, type 1.
+    Q5_1,
+    /// 8-bit block quantization, type 0.
+    Q8_0,
+    /// 8-bit block quantization, type 1.
+    Q8_1,
+    /// 2-bit K-quant.
+    Q2_K,
+    /// 3-bit K-quant.
+    Q3_K,
+    /// 4-bit K-quant.
+    Q4_K,
+    /// 5-bit K-quant.
+    Q5_K,
+    /// 6-bit K-quant.
+    Q6_K,
+    /// 8-bit K-quant.
+    Q8_K,
+    /// Importance-weighted 2-bit, extra-extra-small.
+    IQ2_XXS,
+    /// Importance-weighted 2-bit, extra-small.
+    IQ2_XS,
+    /// Importance-weighted 2-bit, small.
+    IQ2_S,
+    /// Importance-weighted 3-bit, extra-extra-small.
+    IQ3_XXS,
+    /// Importance-weighted 3-bit, small.
+    IQ3_S,
+    /// Importance-weighted 1-bit, small.
+    IQ1_S,
+    /// Importance-weighted 1-bit, medium.
+    IQ1_M,
+    /// Importance-weighted 4-bit, extra-small.
+    IQ4_XS,
+    /// Importance-weighted 4-bit, non-linear.
+    IQ4_NL,
+    /// Signed 8-bit integer.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// Ternary 1-bit, type 0.
+    TQ1_0,
+    /// Ternary 2-bit, type 0.
+    TQ2_0,
+    /// Microscaling FP4.
+    MXFP4,
+}
+
+impl From<KvCacheType> for llama_cpp_2::context::params::KvCacheType {
+    fn from(value: KvCacheType) -> Self {
+        use llama_cpp_2::context::params::KvCacheType as Upstream;
+        match value {
+            KvCacheType::F32 => Upstream::F32,
+            KvCacheType::F16 => Upstream::F16,
+            KvCacheType::BF16 => Upstream::BF16,
+            KvCacheType::F64 => Upstream::F64,
+            KvCacheType::Q4_0 => Upstream::Q4_0,
+            KvCacheType::Q4_1 => Upstream::Q4_1,
+            KvCacheType::Q5_0 => Upstream::Q5_0,
+            KvCacheType::Q5_1 => Upstream::Q5_1,
+            KvCacheType::Q8_0 => Upstream::Q8_0,
+            KvCacheType::Q8_1 => Upstream::Q8_1,
+            KvCacheType::Q2_K => Upstream::Q2_K,
+            KvCacheType::Q3_K => Upstream::Q3_K,
+            KvCacheType::Q4_K => Upstream::Q4_K,
+            KvCacheType::Q5_K => Upstream::Q5_K,
+            KvCacheType::Q6_K => Upstream::Q6_K,
+            KvCacheType::Q8_K => Upstream::Q8_K,
+            KvCacheType::IQ2_XXS => Upstream::IQ2_XXS,
+            KvCacheType::IQ2_XS => Upstream::IQ2_XS,
+            KvCacheType::IQ2_S => Upstream::IQ2_S,
+            KvCacheType::IQ3_XXS => Upstream::IQ3_XXS,
+            KvCacheType::IQ3_S => Upstream::IQ3_S,
+            KvCacheType::IQ1_S => Upstream::IQ1_S,
+            KvCacheType::IQ1_M => Upstream::IQ1_M,
+            KvCacheType::IQ4_XS => Upstream::IQ4_XS,
+            KvCacheType::IQ4_NL => Upstream::IQ4_NL,
+            KvCacheType::I8 => Upstream::I8,
+            KvCacheType::I16 => Upstream::I16,
+            KvCacheType::I32 => Upstream::I32,
+            KvCacheType::I64 => Upstream::I64,
+            KvCacheType::TQ1_0 => Upstream::TQ1_0,
+            KvCacheType::TQ2_0 => Upstream::TQ2_0,
+            KvCacheType::MXFP4 => Upstream::MXFP4,
+        }
+    }
+}
+
 /// KV cache quantization configuration.
 ///
 /// Controls the data type used for the attention K and V caches. llama.cpp defaults
@@ -348,17 +469,17 @@ impl CheckpointParams {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct KvCacheParams {
-    /// Data type for the K cache (default: `KvCacheType::F16`).
-    pub type_k: llama_cpp_2::context::params::KvCacheType,
-    /// Data type for the V cache (default: `KvCacheType::F16`).
-    pub type_v: llama_cpp_2::context::params::KvCacheType,
+    /// Data type for the K cache (default: [`KvCacheType::F16`]).
+    pub type_k: KvCacheType,
+    /// Data type for the V cache (default: [`KvCacheType::F16`]).
+    pub type_v: KvCacheType,
 }
 
 impl Default for KvCacheParams {
     fn default() -> Self {
         Self {
-            type_k: llama_cpp_2::context::params::KvCacheType::F16,
-            type_v: llama_cpp_2::context::params::KvCacheType::F16,
+            type_k: KvCacheType::F16,
+            type_v: KvCacheType::F16,
         }
     }
 }
@@ -366,14 +487,14 @@ impl Default for KvCacheParams {
 impl KvCacheParams {
     /// Override the K cache data type.
     #[must_use]
-    pub fn with_type_k(mut self, type_k: llama_cpp_2::context::params::KvCacheType) -> Self {
+    pub fn with_type_k(mut self, type_k: KvCacheType) -> Self {
         self.type_k = type_k;
         self
     }
 
     /// Override the V cache data type.
     #[must_use]
-    pub fn with_type_v(mut self, type_v: llama_cpp_2::context::params::KvCacheType) -> Self {
+    pub fn with_type_v(mut self, type_v: KvCacheType) -> Self {
         self.type_v = type_v;
         self
     }
