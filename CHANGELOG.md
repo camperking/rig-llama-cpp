@@ -25,7 +25,19 @@ rather than caret-resolving across `0.x` boundaries.
 
 ## [Unreleased]
 
+### Added
+
+- `LoadError` (`thiserror`, `#[non_exhaustive]`): typed error returned by
+  `Client::from_gguf`, `Client::from_gguf_with_mmproj`, `Client::reload`,
+  and `EmbeddingClient::from_gguf` instead of `anyhow::Error` /
+  `Result<(), String>`. Variants: `BackendInit`, `ConfigureDevices`,
+  `Fit`, `ModelLoad`, `MmprojInit` (mtmd-only), `InvalidPath`,
+  `WorkerInitDisconnected`, `WorkerNotRunning`.
+
 ### Changed
+
+- `anyhow` is no longer a direct dependency; it is dev-only (used by the
+  examples). Doctests use `Box<dyn std::error::Error>`.
 
 - Repointed `llama-cpp-2` and `llama-cpp-sys-2` to the upstream
   `utilityai/llama-cpp-rs` crates.io releases (`0.1.146`); the previously

@@ -1,3 +1,4 @@
+use crate::error::LoadError;
 use crate::types::{FitParams, KvCacheParams};
 
 pub(crate) struct WorkerModel {
@@ -17,7 +18,7 @@ pub(crate) fn fit_and_load_model(
     fit: &FitParams,
     kv_cache: &KvCacheParams,
     logs_enabled: bool,
-) -> Result<WorkerModel, String> {
+) -> Result<WorkerModel, LoadError> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::list_llama_ggml_backend_devices;
     use llama_cpp_2::model::LlamaModel as LlamaCppModel;
@@ -38,7 +39,7 @@ pub(crate) fn fit_and_load_model(
         if !vulkan_devices.is_empty() {
             model_params = model_params
                 .with_devices(&vulkan_devices)
-                .map_err(|e| format!("Failed to configure Vulkan devices: {e}"))?;
+                .map_err(|e| LoadError::ConfigureDevices(e.to_string()))?;
             if logs_enabled {
                 eprintln!("Using Vulkan backend devices: {vulkan_devices:?}");
             }
@@ -59,8 +60,8 @@ pub(crate) fn fit_and_load_model(
         .unwrap_or_else(|| vec![1 << 30; max_devices]);
     margins.resize(max_devices, 1 << 30);
 
-    let model_cstr =
-        std::ffi::CString::new(model_path).map_err(|e| format!("Invalid model path: {e}"))?;
+    let model_cstr = std::ffi::CString::new(model_path)
+        .map_err(|e| LoadError::InvalidPath(e.to_string()))?;
 
     let log_level = if logs_enabled {
         llama_cpp_sys_2::GGML_LOG_LEVEL_INFO
@@ -81,7 +82,7 @@ pub(crate) fn fit_and_load_model(
             fit.n_ctx_min,
             log_level,
         )
-        .map_err(|e| format!("Parameter fitting failed: {e}"))?;
+        .map_err(|e| LoadError::Fit(e.to_string()))?;
 
     let actual_n_ctx = fit_result.n_ctx;
 
@@ -95,7 +96,7 @@ pub(crate) fn fit_and_load_model(
     }
 
     let model = LlamaCppModel::load_from_file(backend, model_path, &pinned_params)
-        .map_err(|e| format!("Model load failed: {e}"))?;
+        .map_err(|e| LoadError::ModelLoad(e.to_string()))?;
 
     if logs_enabled {
         eprintln!("Model loaded.");
@@ -105,7 +106,7 @@ pub(crate) fn fit_and_load_model(
     let mtmd_ctx = if let Some(mmproj) = mmproj_path {
         let mtmd_params = llama_cpp_2::mtmd::MtmdContextParams::default();
         let ctx = llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params)
-            .map_err(|e| format!("Multimodal projector init failed: {e}"))?;
+            .map_err(|e| LoadError::MmprojInit(e.to_string()))?;
         if logs_enabled {
             eprintln!("Multimodal projector loaded from {mmproj}.");
         }

@@ -41,7 +41,7 @@
 //! use rig_llama_cpp::{CheckpointParams, FitParams, KvCacheParams, SamplingParams};
 //!
 //! # #[tokio::main]
-//! # async fn main() -> Result<(), anyhow::Error> {
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = rig_llama_cpp::Client::from_gguf(
 //!     "path/to/model.gguf",
 //!     8192, // n_ctx
@@ -65,6 +65,7 @@
 
 mod types;
 mod client;
+mod error;
 mod request;
 mod slot;
 mod worker;
@@ -86,6 +87,7 @@ pub use types::{
 pub use llama_cpp_2::context::params::KvCacheType;
 pub use client::{Client, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
+pub use error::LoadError;
 
 fn env_flag_enabled(name: &str) -> bool {
     match std::env::var(name) {

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use crate::checkpoint::{
     PersistentCtx, ensure_persistent_ctx, maybe_create_checkpoint, restore_or_clear,
 };
+use crate::error::LoadError;
 #[cfg(feature = "mtmd")]
 use crate::image::run_image_inference;
 use crate::loader::{WorkerModel, fit_and_load_model};
@@ -105,13 +106,13 @@ pub(crate) fn inference_worker(
     fit_params: &FitParams,
     kv_cache_params: &KvCacheParams,
     checkpoint_params: CheckpointParams,
-    init_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    init_tx: std::sync::mpsc::Sender<Result<(), LoadError>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
     let backend = match crate::shared_backend() {
         Ok(b) => b,
         Err(e) => {
-            let _ = init_tx.send(Err(e));
+            let _ = init_tx.send(Err(LoadError::BackendInit(e)));
             return;
         }
     };

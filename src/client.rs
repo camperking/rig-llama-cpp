@@ -8,6 +8,7 @@ use rig::streaming::StreamingCompletionResponse;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::error::LoadError;
 use crate::request::prepare_request;
 use crate::types::{
     CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceRequest,
@@ -43,7 +44,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the backend fails to initialize or the model cannot be loaded.
+    /// Returns a [`LoadError`] if the backend fails to initialise, automatic
+    /// fitting fails, or the model cannot be loaded.
     pub fn from_gguf(
         model_path: impl Into<String>,
         n_ctx: u32,
@@ -51,10 +53,10 @@ impl Client {
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
         checkpoint_params: CheckpointParams,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, LoadError> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), LoadError>>();
 
         let worker_handle = thread::spawn(move || {
             inference_worker(
@@ -71,8 +73,7 @@ impl Client {
 
         init_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("Inference thread panicked during initialization"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|_| LoadError::WorkerInitDisconnected)??;
 
         Ok(Self {
             request_tx,
@@ -97,8 +98,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the backend fails to initialize, the model cannot be loaded,
-    /// or the multimodal projector cannot be initialized.
+    /// Returns a [`LoadError`] if the backend fails to initialise, the model
+    /// cannot be loaded, or the multimodal projector cannot be initialised.
     #[cfg(feature = "mtmd")]
     pub fn from_gguf_with_mmproj(
         model_path: impl Into<String>,
@@ -108,11 +109,11 @@ impl Client {
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
         checkpoint_params: CheckpointParams,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, LoadError> {
         let model_path = model_path.into();
         let mmproj_path = mmproj_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), LoadError>>();
 
         let worker_handle = thread::spawn(move || {
             inference_worker(
@@ -129,8 +130,7 @@ impl Client {
 
         init_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("Inference thread panicked during initialization"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|_| LoadError::WorkerInitDisconnected)??;
 
         Ok(Self {
             request_tx,
@@ -144,6 +144,12 @@ impl Client {
     /// This swaps the model in-place on the existing inference thread, avoiding the
     /// `LlamaBackend` singleton re-initialization race that occurs when dropping and
     /// recreating a `Client`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::WorkerNotRunning`] if the inference worker is no
+    /// longer accepting commands, or any of the load-stage variants if the
+    /// new model fails to come up.
     pub fn reload(
         &self,
         model_path: String,
@@ -153,7 +159,7 @@ impl Client {
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
         checkpoint_params: CheckpointParams,
-    ) -> Result<(), String> {
+    ) -> Result<(), LoadError> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         self.request_tx
             .send(InferenceCommand::Reload(ReloadRequest {
@@ -165,10 +171,10 @@ impl Client {
                 checkpoint_params,
                 result_tx,
             }))
-            .map_err(|_| "Worker thread not running".to_string())?;
+            .map_err(|_| LoadError::WorkerNotRunning)?;
         let result = result_rx
             .recv()
-            .map_err(|_| "Worker thread exited during reload".to_string())?;
+            .map_err(|_| LoadError::WorkerInitDisconnected)?;
         if result.is_ok() {
             *self.sampling_params.write().unwrap() = sampling;
         }

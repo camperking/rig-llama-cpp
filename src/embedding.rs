@@ -4,6 +4,8 @@ use std::thread;
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::error::LoadError;
+
 enum EmbeddingCommand {
     Request(EmbeddingRequest),
     Shutdown,
@@ -24,7 +26,7 @@ struct EmbeddingRequest {
 /// use rig::embeddings::EmbeddingModel;
 ///
 /// # #[tokio::main]
-/// # async fn main() -> Result<(), anyhow::Error> {
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let client = rig_llama_cpp::EmbeddingClient::from_gguf(
 ///     "path/to/embedding-model.gguf",
 ///     99,   // n_gpu_layers
@@ -53,15 +55,16 @@ impl EmbeddingClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the backend fails to initialize or the model cannot be loaded.
+    /// Returns a [`LoadError`] if the backend fails to initialise or the
+    /// model cannot be loaded.
     pub fn from_gguf(
         model_path: impl Into<String>,
         n_gpu_layers: u32,
         n_ctx: u32,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, LoadError> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<EmbeddingCommand>();
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<usize, LoadError>>();
 
         let worker_handle = thread::spawn(move || {
             embedding_worker(&model_path, n_gpu_layers, n_ctx, init_tx, &mut request_rx);
@@ -69,8 +72,7 @@ impl EmbeddingClient {
 
         let ndims = init_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("Embedding thread panicked during initialization"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|_| LoadError::WorkerInitDisconnected)??;
 
         Ok(Self {
             request_tx,
@@ -168,7 +170,7 @@ fn embedding_worker(
     model_path: &str,
     n_gpu_layers: u32,
     n_ctx: u32,
-    init_tx: std::sync::mpsc::Sender<Result<usize, String>>,
+    init_tx: std::sync::mpsc::Sender<Result<usize, LoadError>>,
     rx: &mut mpsc::UnboundedReceiver<EmbeddingCommand>,
 ) {
     use llama_cpp_2::list_llama_ggml_backend_devices;
@@ -178,7 +180,7 @@ fn embedding_worker(
     let backend = match crate::shared_backend() {
         Ok(b) => b,
         Err(e) => {
-            let _ = init_tx.send(Err(e));
+            let _ = init_tx.send(Err(LoadError::BackendInit(e)));
             return;
         }
     };
@@ -202,7 +204,7 @@ fn embedding_worker(
                     params
                 }
                 Err(e) => {
-                    let _ = init_tx.send(Err(format!("Failed to configure Vulkan devices: {e}")));
+                    let _ = init_tx.send(Err(LoadError::ConfigureDevices(e.to_string())));
                     return;
                 }
             };
@@ -216,7 +218,7 @@ fn embedding_worker(
     let model = match LlamaCppModel::load_from_file(backend, model_path, &model_params) {
         Ok(m) => m,
         Err(e) => {
-            let _ = init_tx.send(Err(format!("Model load failed: {e}")));
+            let _ = init_tx.send(Err(LoadError::ModelLoad(e.to_string())));
             return;
         }
     };

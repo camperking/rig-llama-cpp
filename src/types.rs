@@ -67,7 +67,7 @@ pub(crate) struct ReloadRequest {
     pub fit_params: FitParams,
     pub kv_cache_params: KvCacheParams,
     pub checkpoint_params: CheckpointParams,
-    pub result_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    pub result_tx: std::sync::mpsc::Sender<Result<(), crate::error::LoadError>>,
 }
 
 pub(crate) struct InferenceRequest {
