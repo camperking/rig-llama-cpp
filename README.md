@@ -2,70 +2,6 @@
 
 A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF models locally via [llama.cpp](https://github.com/ggml-org/llama.cpp) and their Rust bindings [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs).
 
-## Features
-
-- Local inference with any GGUF model
-- Completion and streaming support
-- Tool calling (for models with OpenAI-compatible chat templates)
-- Reasoning / thinking output
-- Vision (multimodal) inference for models with an `mmproj` projector — opt in via the `mtmd` feature
-- Automatic GPU/CPU layer fitting — llama.cpp probes available device memory and picks `n_gpu_layers` for you, no manual tuning required
-- Backend selection via Cargo feature flags
-- Configurable sampling parameters (top-p, top-k, min-p, temperature, penalties)
-
-## Feature Flags
-
-There is **no default GPU backend** — `cargo add rig-llama-cpp` gives you a
-CPU-only build. Pick exactly the backend that matches your hardware:
-
-| Feature  | When to pick it                                                      | Build-time requirements                       |
-| -------- | -------------------------------------------------------------------- | --------------------------------------------- |
-| _(none)_ | CPU-only inference                                                   | C/C++ toolchain                               |
-| `vulkan` | Cross-vendor GPU on Linux/Windows; default for AMD without ROCm      | Vulkan SDK or `libvulkan` + working ICD       |
-| `cuda`   | NVIDIA GPUs                                                          | CUDA toolkit, matching driver                 |
-| `metal`  | Apple Silicon / macOS                                                | Xcode command-line tools                      |
-| `rocm`   | AMD GPUs on Linux                                                    | ROCm toolchain                                |
-| `openmp` | OpenMP CPU threading; orthogonal — combine with any GPU backend      | OpenMP runtime (libgomp / libomp)             |
-| `mtmd`   | Multimodal (vision) inference; enables `ClientBuilder::mmproj` etc.  | (none beyond the chosen backend)              |
-
-Examples:
-
-```sh
-# CPU-only
-cargo build
-
-# Vulkan
-cargo build --features vulkan
-
-# CUDA + multimodal
-cargo build --features "cuda,mtmd"
-
-# CPU + OpenMP threading
-cargo build --features openmp
-```
-
-Backend support also depends on the corresponding `llama-cpp-2` feature and the
-host machine actually having the listed runtime libraries available.
-
-### Platform notes
-
-A successful build does not guarantee a successful run — the host still
-needs the right driver and an actually-supported device. If backend init
-fails at runtime, [`LoadError::BackendInit`] is returned rather than
-panicking, so the application can fall back gracefully.
-
-- **`vulkan`** — needs `libvulkan` (e.g. `libvulkan1` on Debian/Ubuntu) plus a
-  working ICD: `mesa-vulkan-drivers` for AMD/Intel/llvmpipe, the proprietary
-  driver for NVIDIA. `vulkaninfo` should report a non-CPU device for real
-  performance; `lavapipe` (CPU-rendered Vulkan) builds and runs but is slow.
-- **`cuda`** — needs a CUDA toolkit version that matches the installed
-  NVIDIA driver. Mismatch produces a runtime error from `cudaErrorDriver`.
-- **`metal`** — macOS only. Cross-compiling to Linux/Windows with this
-  feature on will fail at the `llama-cpp-sys-2` build step.
-- **`rocm`** — needs the ROCm runtime (`/opt/rocm`) and a supported AMD GPU
-  (gfx9 / RDNA / CDNA). Older / consumer-only devices may be ignored even
-  if ROCm itself installs cleanly.
-
 ## Usage
 
 ```rust
@@ -96,6 +32,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The legacy positional `Client::from_gguf(...)` constructor is still
 available for callers pinned to the 0.1.x API.
+
+## Features
+
+- Local inference with any GGUF model
+- Completion and streaming support
+- Tool calling (for models with OpenAI-compatible chat templates)
+- Reasoning / thinking output
+- Vision (multimodal) inference for models with an `mmproj` projector — opt in via the `mtmd` feature
+- Automatic GPU/CPU layer fitting — llama.cpp probes available device memory and picks `n_gpu_layers` for you, no manual tuning required
+- Backend selection via Cargo feature flags
+- Configurable sampling parameters (top-p, top-k, min-p, temperature, penalties)
+
+## Feature Flags
+
+No default GPU backend — pick the one that matches your hardware:
+
+| Feature  | Use for                                                          |
+| -------- | ---------------------------------------------------------------- |
+| _(none)_ | CPU-only inference                                               |
+| `vulkan` | Cross-vendor GPU on Linux/Windows                                |
+| `cuda`   | NVIDIA GPUs                                                      |
+| `metal`  | Apple Silicon / macOS                                            |
+| `rocm`   | AMD GPUs on Linux                                                |
+| `openmp` | OpenMP CPU threading; combine with any GPU backend               |
+| `mtmd`   | Multimodal (vision) inference; enables `ClientBuilder::mmproj`   |
+
+```sh
+cargo build --features vulkan
+cargo build --features "cuda,mtmd"
+```
+
+Toolchain and runtime requirements per backend are documented upstream
+in [llama.cpp's build guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
+A successful build does not guarantee a successful run — if backend
+init fails at runtime, [`LoadError::BackendInit`] is returned rather
+than panicking, so the application can fall back gracefully.
 
 ## Examples
 
