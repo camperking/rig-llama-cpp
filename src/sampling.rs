@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rig::message::AssistantContent;
 use rig::one_or_many::OneOrMany;
@@ -10,6 +11,7 @@ use crate::types::{
     InferenceParams, InferenceResult, PromptBuildResult, SamplerChain, StreamDeltaState,
     StreamSender,
 };
+use crate::worker::CANCEL_ERR;
 
 fn build_preserved_token_set(
     model: &llama_cpp_2::model::LlamaModel,
@@ -178,6 +180,7 @@ pub(crate) fn sample_tokens_from_pos(
     cached_input_tokens: u64,
     n_past: i32,
     last_entries: &mut Vec<SlotEntry>,
+    cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
     let SamplerChain {
         mut sampler,
@@ -203,6 +206,9 @@ pub(crate) fn sample_tokens_from_pos(
     let mut delta_state = StreamDeltaState::new();
 
     for _ in 0..req.max_tokens {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCEL_ERR.to_string());
+        }
         if let Some(tx) = stream_tx
             && tx.is_closed()
         {
@@ -319,6 +325,7 @@ pub(crate) fn sample_tokens(
     prompt_tokens: u64,
     cached_input_tokens: u64,
     last_entries: &mut Vec<SlotEntry>,
+    cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
     let SamplerChain {
         mut sampler,
@@ -345,6 +352,10 @@ pub(crate) fn sample_tokens(
     let mut delta_state = StreamDeltaState::new();
 
     for _ in 0..req.max_tokens {
+        // Hard cancel from `Client::drop` (or future per-request hook).
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCEL_ERR.to_string());
+        }
         // Stop early if the consumer disconnected (e.g. user cancelled).
         if let Some(tx) = stream_tx
             && tx.is_closed()

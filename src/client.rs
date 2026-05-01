@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use rig::client::CompletionClient;
@@ -18,6 +20,13 @@ use crate::worker::{WorkerInit, inference_worker};
 
 /// Default context window used by [`ClientBuilder`] when `n_ctx` is not set.
 const DEFAULT_N_CTX: u32 = 4096;
+
+/// Capacity of the inference command channel. Bounded to apply backpressure
+/// to misbehaving callers (a flood of requests can't grow the worker's queue
+/// without limit). Eight is generous for a single-worker llama.cpp client —
+/// generation is the bottleneck, not enqueueing — and leaves headroom for
+/// `Reload` / `Shutdown` to slip in alongside in-flight `Request`s.
+const COMMAND_CHANNEL_CAPACITY: usize = 8;
 
 /// Builder for [`Client`].
 ///
@@ -133,8 +142,26 @@ impl ClientBuilder {
 /// through Rig's [`CompletionClient`] trait. Construct one with
 /// [`Client::builder`], or — for backward-compatible positional construction —
 /// [`Client::from_gguf`].
+///
+/// # Lifecycle
+///
+/// The worker thread owns the `LlamaModel`, `LlamaContext`, and (when the
+/// `mtmd` feature is on) the multimodal projector. It only releases that
+/// memory when it exits, which happens in two cases:
+///
+/// - On [`Client::reload`], the worker drops the old model and loads the new
+///   one in place — the `Client` itself is **not** dropped, and the worker
+///   thread is reused. Caller blocks on the reload result.
+/// - On [`Client::drop`], the worker thread is signalled and joined. See
+///   [`impl Drop for Client`](Client#impl-Drop-for-Client) for the exact
+///   semantics — including how a long in-flight generation is cancelled so
+///   the dropping thread doesn't have to wait for it to finish naturally.
 pub struct Client {
-    request_tx: mpsc::UnboundedSender<InferenceCommand>,
+    request_tx: mpsc::Sender<InferenceCommand>,
+    /// Shared shutdown flag. Set by [`Client::drop`] so the worker's prompt
+    /// prefill and sampling loops short-circuit at their next polling point.
+    /// Cloned into the worker via [`WorkerInit::cancel`].
+    cancel: Arc<AtomicBool>,
     sampling_params: std::sync::RwLock<SamplingParams>,
     worker_handle: Option<thread::JoinHandle<()>>,
 }
@@ -241,8 +268,11 @@ impl Client {
         kv_cache_params: KvCacheParams,
         checkpoint_params: CheckpointParams,
     ) -> Result<Self, LoadError> {
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
+        let (request_tx, mut request_rx) =
+            mpsc::channel::<InferenceCommand>(COMMAND_CHANNEL_CAPACITY);
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), LoadError>>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
 
         let worker_handle = thread::spawn(move || {
             let init = WorkerInit {
@@ -252,6 +282,7 @@ impl Client {
                 fit_params: &fit_params,
                 kv_cache_params: &kv_cache_params,
                 checkpoint_params,
+                cancel: worker_cancel,
             };
             inference_worker(init, init_tx, &mut request_rx);
         });
@@ -262,6 +293,7 @@ impl Client {
 
         Ok(Self {
             request_tx,
+            cancel,
             sampling_params: std::sync::RwLock::new(sampling_params),
             worker_handle: Some(worker_handle),
         })
@@ -293,8 +325,12 @@ impl Client {
         checkpoint_params: CheckpointParams,
     ) -> Result<(), LoadError> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        // `blocking_send` is the right call here: `reload` is a sync API and
+        // is documented to be invoked from a `spawn_blocking` task (or any
+        // non-async thread) when used from a tokio context. Backpressure on a
+        // full command queue is fine — reload is itself a blocking operation.
         self.request_tx
-            .send(InferenceCommand::Reload(ReloadRequest {
+            .blocking_send(InferenceCommand::Reload(ReloadRequest {
                 model_path,
                 mmproj_path,
                 n_ctx,
@@ -322,8 +358,37 @@ impl Client {
 }
 
 impl Drop for Client {
+    /// Tear down the worker thread synchronously.
+    ///
+    /// `Drop` blocks until the worker thread has fully exited and the
+    /// `LlamaModel` / `LlamaContext` (and `LlamaBackend` device handles, plus
+    /// the multimodal projector when the `mtmd` feature is on) are released.
+    /// This is intentional: the caller almost always wants to allocate a
+    /// replacement `Client` immediately after dropping this one, and a
+    /// non-blocking drop would briefly hold 2× the model's RAM/VRAM and risk
+    /// OOM. [`Client::reload`] reuses the same worker and avoids this whole
+    /// path; prefer it over drop-and-recreate when you can.
+    ///
+    /// To keep the wait short even when a long generation is mid-flight,
+    /// `Drop` flips the shared cancel flag before signalling shutdown. The
+    /// worker polls the flag at every prompt-prefill chunk boundary and
+    /// every sampled token, so an in-flight `Request` returns within a
+    /// single decode step. The pessimal wait is therefore one decode step,
+    /// not the rest of the generation.
+    ///
+    /// `try_send(Shutdown)` is best-effort: if the bounded command queue is
+    /// full at this instant, the `Shutdown` command isn't enqueued — but the
+    /// in-flight request still bails on the cancel flag, and the worker's
+    /// per-iteration cancel check at the top of its command loop also exits
+    /// the thread before pulling more queued commands.
+    ///
+    /// `Model` clones outliving the `Client` keep the channel sender count
+    /// above zero; their `send` calls naturally fail with `SendError` once
+    /// the receiver is dropped on worker exit, so they don't prevent
+    /// shutdown.
     fn drop(&mut self) {
-        let _ = self.request_tx.send(InferenceCommand::Shutdown);
+        self.cancel.store(true, Ordering::Relaxed);
+        let _ = self.request_tx.try_send(InferenceCommand::Shutdown);
 
         if let Some(worker_handle) = self.worker_handle.take() {
             let _ = worker_handle.join();
@@ -340,7 +405,7 @@ impl CompletionClient for Client {
 /// Obtained via [`CompletionClient::agent`] on a [`Client`].
 #[derive(Clone)]
 pub struct Model {
-    request_tx: mpsc::UnboundedSender<InferenceCommand>,
+    request_tx: mpsc::Sender<InferenceCommand>,
     sampling_params: SamplingParams,
     #[allow(dead_code)]
     model_id: String,
@@ -389,6 +454,7 @@ impl CompletionModel for Model {
                 },
                 response_channel: ResponseChannel::Completion(response_tx),
             }))
+            .await
             .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
 
         let result = response_rx
@@ -434,6 +500,7 @@ impl CompletionModel for Model {
                 },
                 response_channel: ResponseChannel::Streaming(stream_tx),
             }))
+            .await
             .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
 
         Ok(StreamingCompletionResponse::stream(Box::pin(

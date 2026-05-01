@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rig::completion::CompletionError;
 use rig::streaming::RawStreamingChoice;
 use tokio::sync::mpsc;
@@ -16,6 +19,12 @@ use crate::types::{
     CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams,
     ResponseChannel, StreamChunk, StreamSender,
 };
+
+/// Error returned by inference paths when [`Client::drop`] (or a future
+/// per-request cancel hook) flips the shared cancel flag mid-decode. Surfaced
+/// to the response channel so the caller's await wakes up promptly with a
+/// well-known message instead of a hang.
+pub(crate) const CANCEL_ERR: &str = "inference cancelled";
 enum LoopOutcome {
     Reload(crate::types::ReloadRequest),
     Shutdown,
@@ -39,6 +48,10 @@ pub(crate) struct RunCtx<'a, 'm> {
     pub(crate) checkpoint_params: CheckpointParams,
     #[cfg(feature = "mtmd")]
     pub(crate) mtmd_ctx: Option<&'a llama_cpp_2::mtmd::MtmdContext>,
+    /// Shared shutdown signal. Polled at chunk boundaries during prompt
+    /// prefill and per-token in the sampler loop so [`Client::drop`] returns
+    /// promptly even when a long generation is in flight.
+    pub(crate) cancel: &'a AtomicBool,
 }
 
 /// Bringup parameters for [`inference_worker`]. Folded into a struct so the
@@ -50,6 +63,10 @@ pub(crate) struct WorkerInit<'a> {
     pub(crate) fit_params: &'a FitParams,
     pub(crate) kv_cache_params: &'a KvCacheParams,
     pub(crate) checkpoint_params: CheckpointParams,
+    /// Owned clone of the [`Client`]'s cancel flag. The worker re-borrows it
+    /// for each inference call so [`Client::drop`] can short-circuit the
+    /// sampling loop without dropping the channel sender.
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 /// Inner request loop that owns the persistent context.
@@ -61,7 +78,8 @@ fn handle_until_reload<'m>(
     backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
     wm: &'m WorkerModel,
     checkpoint_params: CheckpointParams,
-    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
+    cancel: &AtomicBool,
+    rx: &mut mpsc::Receiver<InferenceCommand>,
 ) -> LoopOutcome {
     let mut persistent: Option<PersistentCtx<'m>> = None;
 
@@ -81,6 +99,7 @@ fn handle_until_reload<'m>(
                     checkpoint_params,
                     #[cfg(feature = "mtmd")]
                     mtmd_ctx: wm.mtmd_ctx.as_ref(),
+                    cancel,
                 };
 
                 match response_channel {
@@ -112,6 +131,14 @@ fn handle_until_reload<'m>(
             InferenceCommand::Reload(reload) => return LoopOutcome::Reload(reload),
             InferenceCommand::Shutdown => return LoopOutcome::Shutdown,
         }
+
+        // Drop sets `cancel` and best-effort-tries to send a Shutdown. If the
+        // channel was full at the time, Shutdown didn't make it in — but the
+        // request we just finished short-circuited via `cancel`, so check it
+        // here and exit before pulling the next queued command.
+        if cancel.load(Ordering::Relaxed) {
+            return LoopOutcome::Shutdown;
+        }
     }
     LoopOutcome::Shutdown
 }
@@ -119,7 +146,7 @@ fn handle_until_reload<'m>(
 pub(crate) fn inference_worker(
     init: WorkerInit<'_>,
     init_tx: std::sync::mpsc::Sender<Result<(), LoadError>>,
-    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
+    rx: &mut mpsc::Receiver<InferenceCommand>,
 ) {
     let backend = match crate::shared_backend() {
         Ok(b) => b,
@@ -150,8 +177,10 @@ pub(crate) fn inference_worker(
     let _ = init_tx.send(Ok(()));
 
     let mut checkpoint_params = init.checkpoint_params;
+    let cancel = init.cancel;
 
-    while let LoopOutcome::Reload(reload) = handle_until_reload(backend, &wm, checkpoint_params, rx)
+    while let LoopOutcome::Reload(reload) =
+        handle_until_reload(backend, &wm, checkpoint_params, &cancel, rx)
     {
         // The persistent context (held inside handle_until_reload) has
         // already been dropped by the time we get here, so it is safe
@@ -250,7 +279,14 @@ fn run_text_inference<'m>(
     // restoring the closest checkpoint or fully clearing the cache.
     let phase1 = {
         let p = ensure_persistent_ctx(ctx.backend, ctx.model, ctx.n_ctx, ctx.kv_cache, persistent)?;
-        prepare_prompt_decode(p, &new_tokens, cached, prompt_len, ctx.checkpoint_params)
+        prepare_prompt_decode(
+            p,
+            &new_tokens,
+            cached,
+            prompt_len,
+            ctx.checkpoint_params,
+            ctx.cancel,
+        )
     };
 
     let (mut batch, effective_cached) = match phase1 {
@@ -271,7 +307,14 @@ fn run_text_inference<'m>(
                     ctx.kv_cache,
                     persistent,
                 )?;
-                prepare_prompt_decode(p, &new_tokens, 0, prompt_len, ctx.checkpoint_params)
+                prepare_prompt_decode(
+                    p,
+                    &new_tokens,
+                    0,
+                    prompt_len,
+                    ctx.checkpoint_params,
+                    ctx.cancel,
+                )
             };
             match retry {
                 Ok(out) => out,
@@ -305,6 +348,7 @@ fn run_text_inference<'m>(
         prompt_tokens,
         cached_tokens,
         &mut p.last_entries,
+        ctx.cancel,
     );
 
     if result.is_err() {
@@ -328,6 +372,7 @@ fn prepare_prompt_decode<'b>(
     cached: usize,
     prompt_len: usize,
     checkpoint_params: CheckpointParams,
+    cancel: &AtomicBool,
 ) -> Result<(llama_cpp_2::llama_batch::LlamaBatch<'b>, usize), String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
@@ -379,6 +424,12 @@ fn prepare_prompt_decode<'b>(
         // Decode the new suffix.
         let suffix = &new_tokens[effective_cached..];
         for (chunk_index, chunk) in suffix.chunks(prompt_batch_limit).enumerate() {
+            // Bail at chunk boundaries so a long prompt prefill (potentially
+            // tens of seconds for a 100k-token prompt on a slow backend)
+            // doesn't keep `Client::drop` waiting.
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCEL_ERR.to_string());
+            }
             batch.clear();
             for (offset, token) in chunk.iter().copied().enumerate() {
                 let abs = effective_cached + chunk_index * prompt_batch_limit + offset;

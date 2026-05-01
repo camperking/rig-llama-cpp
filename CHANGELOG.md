@@ -27,6 +27,12 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Added
 
+- In-flight cancellation. The `Client` now owns an `Arc<AtomicBool>` that is
+  cloned into the worker; both the prompt-prefill chunk loop and the sampler
+  per-token loop poll it and short-circuit with a typed error so a long
+  generation can be torn down without waiting for `max_tokens` or the natural
+  EOS. The flag is set by `Client::drop` today; future minor releases can
+  wire it to a per-request cancel handle.
 - Library-level diagnostics now go through the [`log`] crate facade.
   ~25 internal `eprintln!` calls became `log::{info,debug,warn}!`, so
   consumers can route output to `env_logger`, `tracing-log`, etc., and
@@ -51,6 +57,23 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Changed
 
+- The inference command channel is now bounded (`tokio::sync::mpsc::channel`
+  with capacity 8) instead of unbounded. A misbehaving caller can no longer
+  grow the worker's queue without limit; instead, `Model::completion` /
+  `Model::stream` `await` for queue space, applying natural backpressure.
+  `Client::reload` (sync) uses `blocking_send` and is documented to be
+  invoked from `spawn_blocking` or another non-async thread. `Client::drop`
+  uses `try_send` for `Shutdown` — best-effort, since the cancel-after-command
+  path in the worker also exits the thread when `Drop` flips the cancel flag,
+  so `Shutdown` is just a fast-path wake-up.
+- `Client::drop` is now documented (`# Lifecycle` section + `impl Drop`
+  doc-comment) to explain why it blocks (memory-ordering: the next `Client`
+  must observe the old model's RAM/VRAM as fully released before it allocates)
+  and why the worst-case wait is one decode step rather than the whole
+  generation (the cancel flag short-circuits the sample loop). Long-lived
+  `Model` clones keep the channel sender count above zero but don't prevent
+  shutdown — their `send` calls fail naturally with `SendError` once the
+  worker drops its receiver.
 - Worker call chain refactored around a borrowed `RunCtx<'a, 'm>` and a
   `WorkerInit<'a>` parameter struct, so internal functions stop tripping
   clippy's `too_many_arguments` lint and stay readable as new fields

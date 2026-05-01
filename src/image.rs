@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::checkpoint::{PersistentCtx, ensure_persistent_ctx};
 use crate::prompt::build_prompt;
 use crate::sampling::sample_tokens_from_pos;
 use crate::slot::{SlotEntry, get_common_prefix};
 use crate::types::{InferenceParams, InferenceResult, PromptBuildResult, StreamSender};
-use crate::worker::RunCtx;
+use crate::worker::{CANCEL_ERR, RunCtx};
 
 /// Multimodal (image) inference with the same persistent context the text
 /// path uses, plus image-aware prefix-cache reuse.
@@ -150,6 +152,7 @@ pub(crate) fn run_image_inference<'m>(
                         &prompt_build,
                         req,
                         stream_tx,
+                        ctx.cancel,
                     );
                 }
                 Err(e) => return Err(format!("KV cache trim failed: {e:?}")),
@@ -184,6 +187,7 @@ pub(crate) fn run_image_inference<'m>(
                             &prompt_build,
                             req,
                             stream_tx,
+                            ctx.cancel,
                         );
                     }
                 };
@@ -217,6 +221,11 @@ pub(crate) fn run_image_inference<'m>(
         let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
         let total = suffix_tokens.len();
         for (chunk_index, chunk) in suffix_tokens.chunks(prompt_batch_limit).enumerate() {
+            // Bail at chunk boundaries on shutdown; mtmd suffix decode can be
+            // long for high-resolution image prompts.
+            if ctx.cancel.load(Ordering::Relaxed) {
+                return Err(CANCEL_ERR.to_string());
+            }
             batch.clear();
             for (offset, token) in chunk.iter().copied().enumerate() {
                 let abs = start + chunk_index * prompt_batch_limit + offset;
@@ -249,6 +258,7 @@ pub(crate) fn run_image_inference<'m>(
         &prompt_build,
         req,
         stream_tx,
+        ctx.cancel,
     )
 }
 
@@ -266,6 +276,7 @@ fn finish_image_sample(
     prompt_build: &PromptBuildResult,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
+    cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
     use llama_cpp_2::llama_batch::LlamaBatch;
 
@@ -284,6 +295,7 @@ fn finish_image_sample(
         cached_input_tokens,
         n_past,
         &mut p.last_entries,
+        cancel,
     );
     if result.is_err() {
         // Slot is in an unknown state on sampling failure; the next request
