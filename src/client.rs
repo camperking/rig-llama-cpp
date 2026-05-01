@@ -305,7 +305,14 @@ impl Client {
             .recv()
             .map_err(|_| LoadError::WorkerInitDisconnected)?;
         if result.is_ok() {
-            *self.sampling_params.write().unwrap() = sampling;
+            // SamplingParams is `Copy` (just numeric scalars) — a poisoned
+            // lock can't represent torn or invalid data, so recover the
+            // guard rather than propagate a panic.
+            let mut guard = self
+                .sampling_params
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = sampling;
         }
         result
     }
@@ -342,9 +349,15 @@ impl CompletionModel for Model {
     type Client = Client;
 
     fn make(client: &Client, model: impl Into<String>) -> Self {
+        // See the matching `unwrap_or_else` in `reload`: SamplingParams is
+        // `Copy`, so a poisoned lock still holds valid data.
+        let sampling_params = *client
+            .sampling_params
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         Self {
             request_tx: client.request_tx.clone(),
-            sampling_params: *client.sampling_params.read().unwrap(),
+            sampling_params,
             model_id: model.into(),
         }
     }

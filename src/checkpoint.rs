@@ -78,32 +78,43 @@ impl PersistentCtx<'_> {
     }
 }
 
-pub(crate) fn ensure_persistent_ctx<'m>(
+/// Lazily construct (or reuse) the worker's persistent context and return a
+/// mutable reference to it. The returned reference borrows `persistent` for
+/// its lifetime, so callers can chain operations on the live context without
+/// re-checking the `Option` — when this function returns `Ok`, the slot is
+/// guaranteed to be `Some(_)`.
+pub(crate) fn ensure_persistent_ctx<'a, 'm>(
     backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
     model: &'m llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     kv_cache: &KvCacheParams,
-    persistent: &mut Option<PersistentCtx<'m>>,
-) -> Result<(), String> {
+    persistent: &'a mut Option<PersistentCtx<'m>>,
+) -> Result<&'a mut PersistentCtx<'m>, String> {
     use llama_cpp_2::context::params::LlamaContextParams;
 
-    if persistent.is_some() {
-        return Ok(());
+    // Initialise the slot first, then return the mutable borrow. Done in two
+    // steps because the stable borrow checker (pre-Polonius) refuses the
+    // shorter `if let Some(p) = persistent.as_mut() { return Ok(p) }`-then-
+    // `persistent.insert(...)` form: the early-return borrow is treated as
+    // outliving the second branch.
+    if persistent.is_none() {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_type_k(kv_cache.type_k)
+            .with_type_v(kv_cache.type_v);
+        let ctx = model
+            .new_context(backend, ctx_params)
+            .map_err(|e| format!("Context creation failed: {e}"))?;
+        *persistent = Some(PersistentCtx {
+            ctx,
+            last_entries: Vec::new(),
+            trim_unsupported: false,
+            checkpoints: VecDeque::new(),
+        });
     }
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_type_k(kv_cache.type_k)
-        .with_type_v(kv_cache.type_v);
-    let ctx = model
-        .new_context(backend, ctx_params)
-        .map_err(|e| format!("Context creation failed: {e}"))?;
-    *persistent = Some(PersistentCtx {
-        ctx,
-        last_entries: Vec::new(),
-        trim_unsupported: false,
-        checkpoints: VecDeque::new(),
-    });
-    Ok(())
+    Ok(persistent
+        .as_mut()
+        .expect("persistent context was just initialised above"))
 }
 
 /// Roll the persistent context back to the most recent checkpoint that fits

@@ -39,7 +39,11 @@ pub(crate) fn run_image_inference<'m>(
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let mtmd = mtmd_ctx.expect("run_image_inference called without mtmd context");
+    // The worker dispatches here only when `mtmd_ctx.is_some()`, but return
+    // a typed error rather than panicking if a future refactor breaks that
+    // contract — the worker thread is the only one that can recover.
+    let mtmd = mtmd_ctx
+        .ok_or_else(|| "BUG: run_image_inference called without mtmd context".to_string())?;
 
     // Build bitmaps and stamp each with the FNV id so chunk ids round-trip.
     let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
@@ -81,8 +85,7 @@ pub(crate) fn run_image_inference<'m>(
         ));
     }
 
-    ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
-    let p = persistent.as_mut().unwrap();
+    let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
 
     let cached_lcp = get_common_prefix(&p.last_entries, &new_entries);
     let suffix_has_image = new_entries[cached_lcp..]

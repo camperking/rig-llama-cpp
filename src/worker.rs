@@ -318,14 +318,12 @@ fn run_text_inference<'m>(
         ));
     }
 
-    ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
-
     // Build the candidate as all-Text entries for the diff. Image entries
     // from a previous mtmd turn (if any) compare unequal to text tokens,
     // which is exactly what we want — divergence at the first image position.
     let new_entries: Vec<SlotEntry> = new_tokens.iter().map(|t| SlotEntry::Text(*t)).collect();
     let cached = {
-        let p = persistent.as_ref().unwrap();
+        let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
         get_common_prefix(&p.last_entries, &new_entries)
     };
 
@@ -333,13 +331,12 @@ fn run_text_inference<'m>(
     // retry on failure because no output has been streamed yet. The helper
     // gracefully handles trim-unsupported memories (recurrent/hybrid) by
     // restoring the closest checkpoint or fully clearing the cache.
-    let (mut batch, effective_cached) = match prepare_prompt_decode(
-        persistent.as_mut().unwrap(),
-        &new_tokens,
-        cached,
-        prompt_len,
-        checkpoint_params,
-    ) {
+    let phase1 = {
+        let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+        prepare_prompt_decode(p, &new_tokens, cached, prompt_len, checkpoint_params)
+    };
+
+    let (mut batch, effective_cached) = match phase1 {
         Ok(out) => out,
         Err(e) if cached > 0 => {
             // Some other phase-1 failure mode. Drop persistent, rebuild fresh,
@@ -349,14 +346,11 @@ fn run_text_inference<'m>(
                  Falling back to fresh-context decode."
             );
             *persistent = None;
-            ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
-            match prepare_prompt_decode(
-                persistent.as_mut().unwrap(),
-                &new_tokens,
-                0,
-                prompt_len,
-                checkpoint_params,
-            ) {
+            let retry = {
+                let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+                prepare_prompt_decode(p, &new_tokens, 0, prompt_len, checkpoint_params)
+            };
+            match retry {
                 Ok(out) => out,
                 Err(e) => {
                     *persistent = None;
@@ -373,7 +367,7 @@ fn run_text_inference<'m>(
     // Phase 2: commit the prompt to last_entries and sample. From this point on
     // we may have streamed tokens to the consumer, so any failure invalidates
     // the persistent slot but cannot be retried.
-    let p = persistent.as_mut().unwrap();
+    let p = ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
     p.last_entries = new_entries;
     let prompt_tokens = prompt_len as u64;
     let cached_tokens = effective_cached as u64;

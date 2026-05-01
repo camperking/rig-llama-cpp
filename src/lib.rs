@@ -152,5 +152,12 @@ pub(crate) fn shared_backend()
         // log-silencing API and re-enable suppression here.
     }
     let _ = BACKEND.set(backend);
-    Ok(BACKEND.get().expect("backend just set"))
+    // INVARIANT: we hold `INIT_LOCK` for the duration of this function and
+    // just called `BACKEND.set(backend)`. Any concurrent caller that
+    // reached the second `BACKEND.get().is_some()` check above already
+    // returned, so reaching this line means we are the unique writer and
+    // `BACKEND` is now `Some`. Even if `set()` raced (`Err`-returning),
+    // the "loser" still observes the state filled by the winner — `get()`
+    // is guaranteed to return `Some`.
+    Ok(BACKEND.get().expect("BACKEND set above under INIT_LOCK"))
 }

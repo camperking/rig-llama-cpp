@@ -51,6 +51,13 @@ rather than caret-resolving across `0.x` boundaries.
 
 ### Changed
 
+- Hardened the worker's persistent-context invariant. `ensure_persistent_ctx`
+  now returns `Result<&mut PersistentCtx<'m>, String>` so the live reference
+  flows out of the type system rather than via `Option::unwrap()` at five
+  scattered call sites in `worker.rs` and `image.rs`. `client.rs`'s
+  `sampling_params` `RwLock` accesses recover from poisoning instead of
+  panicking (the wrapped data is `Copy` floats — a poisoned guard still
+  carries valid bytes).
 - **BREAKING (build-time):** the `vulkan` Cargo feature is no longer a
   default. Pick a backend explicitly with `--features vulkan` (or `cuda`,
   `metal`, `rocm`); with no backend feature you get a CPU-only build that
