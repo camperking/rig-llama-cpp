@@ -11,6 +11,14 @@ documentation = "https://docs.rs/rig-llama-cpp"
 readme = "README.md"
 keywords = ["llm", "llama-cpp", "gguf", "inference", "rig"]
 categories = ["api-bindings", "science"]
+# Strip repository-only artefacts from the .crate tarball. We deliberately
+# keep `tests/` in the package because the explicit `[[test]] e2e` entry
+# below references files in that directory; excluding `tests/` would
+# strand the declaration and break `cargo test` on the unpacked crate.
+exclude = [
+    ".github/",
+    "CLAUDE.md",
+]
 
 [package.metadata.docs.rs]
 features = ["mtmd"]
