@@ -192,7 +192,6 @@ pub(crate) fn sample_tokens_from_pos(
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = n_past;
     let mut completion_tokens = 0u64;
 
     let mut stream_parser = if stream_tx.is_some() {
@@ -205,7 +204,7 @@ pub(crate) fn sample_tokens_from_pos(
     };
     let mut delta_state = StreamDeltaState::new();
 
-    for _ in 0..req.max_tokens {
+    for n_cur in (n_past..).take(req.max_tokens as usize) {
         if cancel.load(Ordering::Relaxed) {
             return Err(CANCEL_ERR.to_string());
         }
@@ -277,7 +276,6 @@ pub(crate) fn sample_tokens_from_pos(
         ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
         last_entries.push(SlotEntry::Text(token));
-        n_cur += 1;
     }
 
     log::debug!("raw output:\n{output}");
@@ -340,7 +338,6 @@ pub(crate) fn sample_tokens(
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = prompt_tokens as i32;
     let mut completion_tokens = 0u64;
 
     // Initialize streaming parser if streaming and we have a template result
@@ -354,7 +351,7 @@ pub(crate) fn sample_tokens(
     };
     let mut delta_state = StreamDeltaState::new();
 
-    for _ in 0..req.max_tokens {
+    for n_cur in (prompt_tokens as i32..).take(req.max_tokens as usize) {
         // Hard cancel from `Client::drop` (or future per-request hook).
         if cancel.load(Ordering::Relaxed) {
             return Err(CANCEL_ERR.to_string());
@@ -420,7 +417,6 @@ pub(crate) fn sample_tokens(
         // Track tokens that are now committed to the KV cache so the next
         // request can detect the longest common prefix correctly.
         last_entries.push(SlotEntry::Text(token));
-        n_cur += 1;
     }
 
     log::debug!("raw output:\n{output}");
