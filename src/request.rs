@@ -6,13 +6,17 @@ use serde_json::{Value, json};
 use crate::types::PreparedRequest;
 
 /// Normalize a tool result's content list. rig-core 0.35.0's streaming agent
-/// loop stores the raw tool-output string as plain `ToolResultContent::Text`
-/// in the chat history it sends to the next provider call (its non-streaming
-/// counterpart calls `ToolResultContent::from_tool_output` to parse image
-/// JSON into `Image` variants). This re-parses Text parts here so image
-/// content emitted by tools surfaces as `ToolResultContent::Image` regardless
-/// of which agent path produced the history. No-op for plain-text outputs:
-/// `from_tool_output` falls back to a single Text part on parse failure.
+/// loop stored the raw tool-output string as plain `ToolResultContent::Text`
+/// in the chat history it sent to the next provider call, while its
+/// non-streaming counterpart called `ToolResultContent::from_tool_output` to
+/// parse image JSON into `Image` variants. Upstream rig-core 0.36.0 fixed
+/// this (see rig PR #1661 / issue #1650), so the streaming and non-streaming
+/// paths now agree. This helper is kept as a defensive pass: if a caller
+/// hands us a history produced by an older rig-core, or by some other agent
+/// that still emits raw Text for image tool outputs, we re-parse here so
+/// image content surfaces as `ToolResultContent::Image`. No-op for plain-text
+/// outputs: `from_tool_output` falls back to a single Text part on parse
+/// failure.
 fn normalized_tool_parts(
     content: &OneOrMany<rig::message::ToolResultContent>,
 ) -> Vec<rig::message::ToolResultContent> {

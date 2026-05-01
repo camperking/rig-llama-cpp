@@ -10,8 +10,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::request::prepare_request;
 use crate::types::{
-    FitParams, InferenceCommand, InferenceParams, InferenceRequest, KvCacheParams, RawResponse,
-    ReloadRequest, ResponseChannel, SamplingParams, StreamChunk,
+    CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceRequest,
+    KvCacheParams, RawResponse, ReloadRequest, ResponseChannel, SamplingParams, StreamChunk,
 };
 use crate::worker::inference_worker;
 
@@ -38,6 +38,8 @@ impl Client {
     /// * `sampling_params` — Sampling parameters for token generation.
     /// * `fit_params` — Configuration for the fitting algorithm.
     /// * `kv_cache_params` — KV cache data-type configuration (defaults to F16/F16).
+    /// * `checkpoint_params` — Tunables for the in-memory state-checkpoint cache
+    ///   used to preserve KV/recurrent state across chat turns for hybrid models.
     ///
     /// # Errors
     ///
@@ -48,6 +50,7 @@ impl Client {
         sampling_params: SamplingParams,
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
+        checkpoint_params: CheckpointParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel::<InferenceCommand>();
@@ -60,6 +63,7 @@ impl Client {
                 n_ctx,
                 &fit_params,
                 &kv_cache_params,
+                checkpoint_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -103,6 +107,7 @@ impl Client {
         sampling_params: SamplingParams,
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
+        checkpoint_params: CheckpointParams,
     ) -> anyhow::Result<Self> {
         let model_path = model_path.into();
         let mmproj_path = mmproj_path.into();
@@ -116,6 +121,7 @@ impl Client {
                 n_ctx,
                 &fit_params,
                 &kv_cache_params,
+                checkpoint_params,
                 init_tx,
                 &mut request_rx,
             );
@@ -146,6 +152,7 @@ impl Client {
         sampling: SamplingParams,
         fit_params: FitParams,
         kv_cache_params: KvCacheParams,
+        checkpoint_params: CheckpointParams,
     ) -> Result<(), String> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         self.request_tx
@@ -155,6 +162,7 @@ impl Client {
                 n_ctx,
                 fit_params,
                 kv_cache_params,
+                checkpoint_params,
                 result_tx,
             }))
             .map_err(|_| "Worker thread not running".to_string())?;
@@ -243,7 +251,7 @@ impl CompletionModel for Model {
                 input_tokens: result.prompt_tokens,
                 output_tokens: result.completion_tokens,
                 total_tokens: result.prompt_tokens + result.completion_tokens,
-                cached_input_tokens: 0,
+                cached_input_tokens: result.cached_input_tokens,
                 cache_creation_input_tokens: 0,
             },
             raw_response: RawResponse { text: result.text },

@@ -72,7 +72,9 @@ mod embedding;
 #[cfg(test)]
 mod test;
 
-pub use types::{RawResponse, StreamChunk, SamplingParams, FitParams, KvCacheParams};
+pub use types::{
+    CheckpointParams, FitParams, KvCacheParams, RawResponse, SamplingParams, StreamChunk,
+};
 pub use llama_cpp_2::context::params::KvCacheType;
 pub use client::{Client, Model};
 pub use embedding::{EmbeddingClient, EmbeddingModelHandle};

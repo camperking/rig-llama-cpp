@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroU32;
 
 use rig::completion::CompletionError;
@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 
 use crate::parsing::parse_completion_output;
 use crate::types::{
-    FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams, PreparedRequest,
-    PromptBuildResult, ResponseChannel, SamplerChain, StreamChunk, StreamDeltaState, StreamSender,
+    CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams,
+    PreparedRequest, PromptBuildResult, ResponseChannel, SamplerChain, StreamChunk,
+    StreamDeltaState, StreamSender,
 };
 
 struct WorkerModel {
@@ -138,12 +139,146 @@ fn fit_and_load_model(
     })
 }
 
+/// Persistent inference state carried across requests for prefix-cache reuse.
+///
+/// We hold one `LlamaContext` for the worker's lifetime instead of recreating it
+/// per request, plus the tokens currently decoded into KV-cache slot 0. On each
+/// new prompt we compute the longest common prefix against `last_tokens` and
+/// only decode the suffix — the matching prefix already lives in the cache.
+///
+/// The lifetime `'m` borrows from the active `WorkerModel::model`. The struct is
+/// only ever constructed and dropped inside `handle_until_reload`, so it never
+/// outlives the model reference it borrows from.
+/// Snapshot of the partial seq state (recurrent + SWA KV) at a specific
+/// point in the conversation. Used by hybrid models (Qwen 3.5, Jamba, etc.)
+/// to recover prefix-cache reuse when a partial trim isn't possible.
+///
+/// Mirrors llama-server's `server_prompt_checkpoint`.
+struct Checkpoint {
+    /// Min position covered by the saved partial state at save time. We
+    /// don't currently consult this (the binding doesn't expose
+    /// `seq_pos_min`), but kept for diagnostic logging.
+    #[allow(dead_code)]
+    pos_min: i32,
+    /// Max position covered by the saved partial state — equal to
+    /// `n_tokens - 1`. Used to verify the snapshot is consistent with the
+    /// requested rollback target.
+    pos_max: i32,
+    /// Number of prompt tokens that had been decoded into the cache when
+    /// the snapshot was taken. The next request can resume decoding at
+    /// position `n_tokens` if its LCP length is at least this large.
+    n_tokens: usize,
+    /// Serialized partial state. Size matches whatever
+    /// `state_seq_get_size_ext(0, PARTIAL_ONLY)` returned at save time.
+    data: Vec<u8>,
+}
+
+struct PersistentCtx<'m> {
+    ctx: llama_cpp_2::context::LlamaContext<'m>,
+    last_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Set to true once we've observed that this model's memory implementation
+    /// rejects partial cache trims (`clear_kv_cache_seq` returning `Ok(false)`).
+    /// Recurrent/hybrid models like Mamba/RWKV/Jamba can't roll back the
+    /// recurrent state to an arbitrary position. When this flag is set we
+    /// route rollback requests through the checkpoint-restore path (or full
+    /// clear when no usable checkpoint exists). Extension-mode reuse
+    /// (`cached == last_tokens.len()`) works regardless.
+    trim_unsupported: bool,
+    /// In-memory partial-state snapshots, oldest first. Bounded by
+    /// `CheckpointParams::max_checkpoints`.
+    checkpoints: VecDeque<Checkpoint>,
+}
+
+enum LoopOutcome {
+    Reload(crate::types::ReloadRequest),
+    Shutdown,
+}
+
+/// Inner request loop that owns the persistent context.
+///
+/// Returns when the channel closes, a reload is requested, or shutdown is requested.
+/// On Reload the caller drops `wm` and reloads the model — the persistent context
+/// (which borrows `&wm.model`) is dropped automatically when this function returns.
+fn handle_until_reload<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    wm: &'m WorkerModel,
+    checkpoint_params: CheckpointParams,
+    rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
+) -> LoopOutcome {
+    let mut persistent: Option<PersistentCtx<'m>> = None;
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            InferenceCommand::Request(req) => {
+                let crate::types::InferenceRequest {
+                    params,
+                    response_channel,
+                } = req;
+
+                #[cfg(feature = "mtmd")]
+                let mtmd_ref = wm.mtmd_ctx.as_ref();
+                #[cfg(not(feature = "mtmd"))]
+                let mtmd_ref: Option<&()> = None;
+
+                match response_channel {
+                    ResponseChannel::Completion(tx) => {
+                        let result = run_inference(
+                            backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &wm.kv_cache,
+                            checkpoint_params,
+                            &mut persistent,
+                            &params,
+                            None,
+                            mtmd_ref,
+                        );
+                        let _ = tx.send(result);
+                    }
+                    ResponseChannel::Streaming(stream_tx) => {
+                        let result = run_inference(
+                            backend,
+                            &wm.model,
+                            wm.n_ctx,
+                            &wm.kv_cache,
+                            checkpoint_params,
+                            &mut persistent,
+                            &params,
+                            Some(&stream_tx),
+                            mtmd_ref,
+                        );
+                        match result {
+                            Ok(result) => {
+                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
+                                    StreamChunk {
+                                        text: result.text,
+                                        prompt_tokens: Some(result.prompt_tokens),
+                                        completion_tokens: Some(result.completion_tokens),
+                                        cached_input_tokens: Some(result.cached_input_tokens),
+                                    },
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
+                            }
+                        }
+                    }
+                }
+            }
+            InferenceCommand::Reload(reload) => return LoopOutcome::Reload(reload),
+            InferenceCommand::Shutdown => return LoopOutcome::Shutdown,
+        }
+    }
+    LoopOutcome::Shutdown
+}
+
 pub(crate) fn inference_worker(
     model_path: &str,
     mmproj_path: Option<&str>,
     n_ctx: u32,
     fit_params: &FitParams,
     kv_cache_params: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
     init_tx: std::sync::mpsc::Sender<Result<(), String>>,
     rx: &mut mpsc::UnboundedReceiver<InferenceCommand>,
 ) {
@@ -175,61 +310,14 @@ pub(crate) fn inference_worker(
     // Signal successful initialization
     let _ = init_tx.send(Ok(()));
 
-    // Process inference requests
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            InferenceCommand::Request(req) => {
-                let crate::types::InferenceRequest {
-                    params,
-                    response_channel,
-                } = req;
+    let mut checkpoint_params = checkpoint_params;
 
-                #[cfg(feature = "mtmd")]
-                let mtmd_ref = wm.mtmd_ctx.as_ref();
-                #[cfg(not(feature = "mtmd"))]
-                let mtmd_ref: Option<&()> = None;
-
-                match response_channel {
-                    ResponseChannel::Completion(tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            &params,
-                            None,
-                            mtmd_ref,
-                        );
-                        let _ = tx.send(result);
-                    }
-                    ResponseChannel::Streaming(stream_tx) => {
-                        let result = run_inference(
-                            backend,
-                            &wm.model,
-                            wm.n_ctx,
-                            &wm.kv_cache,
-                            &params,
-                            Some(&stream_tx),
-                            mtmd_ref,
-                        );
-                        match result {
-                            Ok(result) => {
-                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
-                                    StreamChunk {
-                                        text: result.text,
-                                        prompt_tokens: Some(result.prompt_tokens),
-                                        completion_tokens: Some(result.completion_tokens),
-                                    },
-                                )));
-                            }
-                            Err(e) => {
-                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
-                            }
-                        }
-                    }
-                }
-            }
-            InferenceCommand::Reload(reload) => {
+    loop {
+        match handle_until_reload(backend, &wm, checkpoint_params, rx) {
+            LoopOutcome::Reload(reload) => {
+                // The persistent context (held inside handle_until_reload) has
+                // already been dropped by the time we get here, so it is safe
+                // to drop and replace `wm`.
                 drop(wm);
 
                 let result = fit_and_load_model(
@@ -245,6 +333,7 @@ pub(crate) fn inference_worker(
                 match result {
                     Ok(new_wm) => {
                         wm = new_wm;
+                        checkpoint_params = reload.checkpoint_params;
                         let _ = reload.result_tx.send(Ok(()));
                     }
                     Err(e) => {
@@ -253,13 +342,523 @@ pub(crate) fn inference_worker(
                     }
                 }
             }
-            InferenceCommand::Shutdown => break,
+            LoopOutcome::Shutdown => break,
         }
     }
 }
 
 #[cfg(feature = "mtmd")]
-fn run_inference(
+fn run_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+        mtmd_ctx,
+    )
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    _mtmd_ctx: Option<&()>,
+) -> Result<InferenceResult, String> {
+    run_inference_inner(
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+    )
+}
+
+#[cfg(not(feature = "mtmd"))]
+fn run_inference_inner<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+) -> Result<InferenceResult, String> {
+    run_text_inference(
+        backend,
+        model,
+        n_ctx,
+        kv_cache,
+        checkpoint_params,
+        persistent,
+        req,
+        stream_tx,
+    )
+}
+
+#[cfg(feature = "mtmd")]
+fn run_inference_inner<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
+) -> Result<InferenceResult, String> {
+    let has_images = !req.prepared_request.images.is_empty();
+
+    if has_images && mtmd_ctx.is_some() {
+        // Image turns use a fresh, throwaway context. The persistent text-only
+        // KV cache is left untouched: when the next text turn arrives, its
+        // history will include this turn's text representation, which the LCP
+        // path will simply decode as new suffix.
+        run_image_inference(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
+    } else {
+        run_text_inference(
+            backend,
+            model,
+            n_ctx,
+            kv_cache,
+            checkpoint_params,
+            persistent,
+            req,
+            stream_tx,
+        )
+    }
+}
+
+/// Text-only inference with persistent-context + prefix-cache reuse.
+///
+/// On each call we tokenize the new prompt, find the longest common prefix with
+/// the tokens currently committed in the KV cache, trim everything after that
+/// prefix, and decode only the suffix. If prefix-cache reuse fails (which can
+/// happen e.g. on memory implementations that don't support arbitrary partial
+/// trims), we invalidate the persistent slot and retry once with a fresh
+/// context — so the user's request still succeeds at the cost of a full decode.
+fn run_text_inference<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    checkpoint_params: CheckpointParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+) -> Result<InferenceResult, String> {
+    use llama_cpp_2::model::AddBos;
+
+    let prompt_build = build_prompt(model, &req.prepared_request)?;
+    let prompt = prompt_build.prompt.as_str();
+
+    let new_tokens = model
+        .str_to_token(prompt, AddBos::Always)
+        .map_err(|e| format!("Tokenization failed: {e}"))?;
+    let prompt_len = new_tokens.len();
+
+    if prompt_len == 0 {
+        return Err("Empty prompt after tokenization".to_string());
+    }
+    if prompt_len > n_ctx as usize {
+        return Err(format!(
+            "Prompt {prompt_len} tokens exceeds n_ctx {n_ctx}"
+        ));
+    }
+
+    ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+
+    let cached = {
+        let p = persistent.as_ref().unwrap();
+        p.last_tokens
+            .iter()
+            .zip(new_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+
+    // Phase 1: prompt decode (with prefix-cache reuse). This phase is safe to
+    // retry on failure because no output has been streamed yet. The helper
+    // gracefully handles trim-unsupported memories (recurrent/hybrid) by
+    // restoring the closest checkpoint or fully clearing the cache.
+    let (mut batch, effective_cached) = match prepare_prompt_decode(
+        persistent.as_mut().unwrap(),
+        &new_tokens,
+        cached,
+        prompt_len,
+        checkpoint_params,
+    ) {
+        Ok(out) => out,
+        Err(e) if cached > 0 => {
+            // Some other phase-1 failure mode. Drop persistent, rebuild fresh,
+            // and retry from scratch. Safe because no output has streamed yet.
+            eprintln!(
+                "[rig-llama-cpp] prefix-cache decode failed (cached={cached}, prompt_len={prompt_len}): {e}. \
+                 Falling back to fresh-context decode."
+            );
+            *persistent = None;
+            ensure_persistent_ctx(backend, model, n_ctx, kv_cache, persistent)?;
+            match prepare_prompt_decode(
+                persistent.as_mut().unwrap(),
+                &new_tokens,
+                0,
+                prompt_len,
+                checkpoint_params,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    *persistent = None;
+                    return Err(e);
+                }
+            }
+        }
+        Err(e) => {
+            *persistent = None;
+            return Err(e);
+        }
+    };
+
+    // Phase 2: commit the prompt to last_tokens and sample. From this point on
+    // we may have streamed tokens to the consumer, so any failure invalidates
+    // the persistent slot but cannot be retried.
+    let p = persistent.as_mut().unwrap();
+    p.last_tokens = new_tokens;
+    let prompt_tokens = prompt_len as u64;
+    let cached_tokens = effective_cached as u64;
+
+    let result = sample_tokens(
+        model,
+        &mut p.ctx,
+        &mut batch,
+        &prompt_build,
+        req,
+        stream_tx,
+        prompt_tokens,
+        cached_tokens,
+        &mut p.last_tokens,
+    );
+
+    if result.is_err() {
+        *persistent = None;
+    }
+    result
+}
+
+fn ensure_persistent_ctx<'m>(
+    backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
+    model: &'m llama_cpp_2::model::LlamaModel,
+    n_ctx: u32,
+    kv_cache: &KvCacheParams,
+    persistent: &mut Option<PersistentCtx<'m>>,
+) -> Result<(), String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
+
+    if persistent.is_some() {
+        return Ok(());
+    }
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_type_k(kv_cache.type_k)
+        .with_type_v(kv_cache.type_v);
+    let ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| format!("Context creation failed: {e}"))?;
+    *persistent = Some(PersistentCtx {
+        ctx,
+        last_tokens: Vec::new(),
+        trim_unsupported: false,
+        checkpoints: VecDeque::new(),
+    });
+    Ok(())
+}
+
+/// Decode the prompt suffix into the persistent context's KV cache and return
+/// a batch ready for sampling, plus the count of tokens that were actually
+/// served from the cache (which may be less than the LCP if a rollback wasn't
+/// possible). This is "phase 1" — safe to retry on failure because no output
+/// has been streamed to the consumer yet.
+///
+/// For models whose memory rejects partial trims (recurrent/hybrid), we
+/// attempt to restore from the closest in-memory state checkpoint before
+/// falling back to a full clear.
+fn prepare_prompt_decode<'b>(
+    p: &mut PersistentCtx<'_>,
+    new_tokens: &[llama_cpp_2::token::LlamaToken],
+    cached: usize,
+    prompt_len: usize,
+    checkpoint_params: CheckpointParams,
+) -> Result<(llama_cpp_2::llama_batch::LlamaBatch<'b>, usize), String> {
+    use llama_cpp_2::llama_batch::LlamaBatch;
+
+    if crate::llama_logs_enabled() {
+        eprintln!(
+            "[rig-llama-cpp] prefix-cache: prompt_len={prompt_len} last_tokens.len={} cached={cached} trim_unsupported={} checkpoints={}",
+            p.last_tokens.len(),
+            p.trim_unsupported,
+            p.checkpoints.len(),
+        );
+    }
+
+    let mut effective_cached = cached;
+
+    if cached < p.last_tokens.len() {
+        // Need to roll back the cache to position `cached`.
+        if p.trim_unsupported {
+            // Already known: trim refused before. Try checkpoint restore.
+            effective_cached = restore_or_clear(p, cached);
+        } else {
+            let removed = p
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(cached as u32), None)
+                .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+            if removed {
+                // Trim worked. Drop checkpoints whose pos_max >= cached because
+                // the state they captured is now invalid (positions ahead of
+                // the trim boundary).
+                p.checkpoints.retain(|c| (c.pos_max as usize) < cached);
+            } else {
+                // First time this model rejects a partial trim. Mark it and
+                // try the checkpoint path.
+                eprintln!(
+                    "[rig-llama-cpp] partial KV-cache trim not supported by this model \
+                     (likely recurrent/hybrid). Routing rollbacks through checkpoint restore."
+                );
+                p.trim_unsupported = true;
+                effective_cached = restore_or_clear(p, cached);
+            }
+        }
+    } else {
+        // No rollback needed (extension only or full match). Drop checkpoints
+        // whose pos_max would land past where we're now operating.
+        p.checkpoints.retain(|c| (c.pos_max as usize) < cached.max(1));
+    }
+
+    let prompt_batch_limit = p.ctx.n_batch().max(1) as usize;
+    let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
+
+    if effective_cached < prompt_len {
+        // Decode the new suffix.
+        let suffix = &new_tokens[effective_cached..];
+        for (chunk_index, chunk) in suffix.chunks(prompt_batch_limit).enumerate() {
+            batch.clear();
+            for (offset, token) in chunk.iter().copied().enumerate() {
+                let abs = effective_cached + chunk_index * prompt_batch_limit + offset;
+                let is_last_prompt_token = abs + 1 == prompt_len;
+                batch
+                    .add(token, abs as i32, &[0], is_last_prompt_token)
+                    .map_err(|e| format!("Batch add failed: {e}"))?;
+            }
+            if batch.n_tokens() == 0 {
+                return Err(format!(
+                    "BUG: empty prompt batch at chunk {chunk_index} (suffix.len={}, prompt_batch_limit={})",
+                    suffix.len(),
+                    prompt_batch_limit,
+                ));
+            }
+            p.ctx
+                .decode(&mut batch)
+                .map_err(|e| format!("Prompt decode failed: {e}"))?;
+
+            let n_tokens_decoded =
+                effective_cached + chunk_index * prompt_batch_limit + chunk.len();
+            maybe_create_checkpoint(p, checkpoint_params, n_tokens_decoded, prompt_len);
+        }
+    } else {
+        // Whole prompt already cached. Roll back the last position by one and
+        // re-decode it so the sampler has a fresh `logits=true` slot to read.
+        // Only reachable when trim is supported (otherwise effective_cached
+        // would have been reset to 0 above).
+        let removed = p
+            .ctx
+            .clear_kv_cache_seq(Some(0), Some((prompt_len - 1) as u32), None)
+            .map_err(|e| format!("KV cache trim failed: {e:?}"))?;
+        if !removed {
+            return Err(format!(
+                "KV cache trim (rollback) returned false at pos {}",
+                prompt_len - 1
+            ));
+        }
+        batch.clear();
+        batch
+            .add(
+                new_tokens[prompt_len - 1],
+                (prompt_len - 1) as i32,
+                &[0],
+                true,
+            )
+            .map_err(|e| format!("Batch add failed: {e}"))?;
+        p.ctx
+            .decode(&mut batch)
+            .map_err(|e| format!("Prompt decode failed: {e}"))?;
+    }
+
+    Ok((batch, effective_cached))
+}
+
+/// Attempt to restore the closest in-memory checkpoint that covers a prefix
+/// of length `<= cached`. Returns the number of tokens now committed to the
+/// cache (`n_tokens` of the restored checkpoint, or `0` if no checkpoint
+/// was usable and we had to fully clear).
+///
+/// On success, the regular KV cache is also trimmed to the checkpoint's
+/// position so the cache state is consistent for subsequent decoding.
+fn restore_or_clear(p: &mut PersistentCtx<'_>, cached: usize) -> usize {
+    // Newest-first search for a checkpoint whose covered range fits within
+    // the prefix we want to keep. A checkpoint with `n_tokens > cached` would
+    // overshoot the LCP and put the cache into a state the new prompt
+    // doesn't actually share.
+    let candidate_idx = p
+        .checkpoints
+        .iter()
+        .rposition(|c| c.n_tokens <= cached && (c.pos_max as usize) < cached);
+
+    if let Some(idx) = candidate_idx {
+        let n_tokens = p.checkpoints[idx].n_tokens;
+        let restored = unsafe {
+            p.ctx.state_seq_set_data_ext(
+                &p.checkpoints[idx].data,
+                0,
+                llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY,
+            )
+        };
+
+        if restored {
+            // After restoring partial state, the recurrent/SWA state is at
+            // the checkpoint's position. Trim any stale regular-KV positions
+            // ahead of it. For hybrid models this trim now succeeds because
+            // the recurrent tail is no longer in the trim range.
+            let _ = p
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(n_tokens as u32), None);
+
+            // Truncate the tracked tokens to match.
+            p.last_tokens.truncate(n_tokens);
+
+            // Drop checkpoints AFTER this one (they captured later state we
+            // just rolled past).
+            p.checkpoints.truncate(idx + 1);
+
+            eprintln!(
+                "[rig-llama-cpp] restored checkpoint at n_tokens={n_tokens} (cached LCP was {cached})"
+            );
+            return n_tokens;
+        }
+
+        eprintln!("[rig-llama-cpp] state_seq_set_data_ext failed; clearing cache.");
+    }
+
+    // No usable checkpoint; full clear.
+    p.ctx.clear_kv_cache();
+    p.last_tokens.clear();
+    p.checkpoints.clear();
+    0
+}
+
+/// Decide whether to snapshot the partial seq state at this point in the
+/// prompt prefill, and do it if so. Mirrors the cadence used by
+/// `llama-server`: always near the end of the prompt, plus optionally
+/// every `every_n_tokens` during the bulk of the prompt.
+fn maybe_create_checkpoint(
+    p: &mut PersistentCtx<'_>,
+    params: CheckpointParams,
+    n_tokens_decoded: usize,
+    prompt_len: usize,
+) {
+    if params.max_checkpoints == 0 {
+        return;
+    }
+    if n_tokens_decoded < params.min_tokens as usize {
+        return;
+    }
+
+    let n_ubatch = p.ctx.n_ubatch().max(1) as usize;
+    // Same offsets as llama-server: 4 + n_ubatch and 4 tokens before the end
+    // of the prompt.
+    let near_end = n_tokens_decoded + 4 + n_ubatch == prompt_len
+        || n_tokens_decoded + 4 == prompt_len;
+
+    let last_n_tokens = p.checkpoints.back().map(|c| c.n_tokens).unwrap_or(0);
+    let cadence_ok = params.every_n_tokens > 0
+        && n_tokens_decoded.saturating_sub(last_n_tokens) >= params.every_n_tokens as usize;
+
+    if !(near_end || cadence_ok) {
+        return;
+    }
+    if !p
+        .checkpoints
+        .back()
+        .is_none_or(|c| n_tokens_decoded.saturating_sub(c.n_tokens) >= params.min_gap as usize)
+    {
+        return;
+    }
+
+    let size = p
+        .ctx
+        .state_seq_get_size_ext(0, llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY);
+    if size == 0 {
+        return;
+    }
+
+    let mut data = vec![0u8; size];
+    let written = unsafe {
+        p.ctx.state_seq_get_data_ext(
+            data.as_mut_ptr(),
+            0,
+            llama_cpp_2::context::session::LlamaStateSeqFlags::PARTIAL_ONLY,
+        )
+    };
+    if written == 0 {
+        return;
+    }
+    data.truncate(written);
+
+    while p.checkpoints.len() >= params.max_checkpoints as usize {
+        p.checkpoints.pop_front();
+    }
+
+    let pos_max = (n_tokens_decoded as i32).saturating_sub(1);
+    p.checkpoints.push_back(Checkpoint {
+        pos_min: 0,
+        pos_max,
+        n_tokens: n_tokens_decoded,
+        data,
+    });
+
+    if crate::llama_logs_enabled() {
+        eprintln!(
+            "[rig-llama-cpp] checkpoint created at n_tokens={n_tokens_decoded} (size={} KiB, total={})",
+            written / 1024,
+            p.checkpoints.len(),
+        );
+    }
+}
+
+#[cfg(feature = "mtmd")]
+fn run_image_inference(
     backend: &llama_cpp_2::llama_backend::LlamaBackend,
     model: &llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
@@ -268,72 +867,55 @@ fn run_inference(
     stream_tx: Option<&StreamSender>,
     mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
 ) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx, mtmd_ctx)
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    _mtmd_ctx: Option<&()>,
-) -> Result<InferenceResult, String> {
-    run_inference_inner(backend, model, n_ctx, kv_cache, req, stream_tx)
-}
-
-#[cfg(not(feature = "mtmd"))]
-fn run_inference_inner(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-) -> Result<InferenceResult, String> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
 
     let prompt_build = build_prompt(model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
+        .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_type_k(kv_cache.type_k)
         .with_type_v(kv_cache.type_v);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| format!("Context creation failed: {e}"))?;
 
-    let tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| format!("Tokenization failed: {e}"))?;
-    let prompt_tokens = tokens.len() as u64;
+    let mtmd = mtmd_ctx.expect("run_image_inference called without mtmd context");
 
-    let prompt_len = tokens.len();
+    let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
+        .prepared_request
+        .images
+        .iter()
+        .map(|bytes| {
+            llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, bytes)
+                .map_err(|e| format!("Failed to create bitmap from image data: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let bitmap_refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
+
+    let text_input = llama_cpp_2::mtmd::MtmdInputText {
+        text: prompt.to_string(),
+        add_special: true,
+        parse_special: true,
+    };
+
+    let chunks = mtmd
+        .tokenize(text_input, &bitmap_refs)
+        .map_err(|e| format!("Multimodal tokenization failed: {e}"))?;
+
+    let prompt_tokens = chunks.total_tokens() as u64;
+    let n_batch = ctx.n_batch() as i32;
+
+    let n_past = chunks
+        .eval_chunks(mtmd, &ctx, 0, 0, n_batch, true)
+        .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
+
     let prompt_batch_limit = ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
 
-    for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
-        batch.clear();
-
-        for (offset, token) in chunk.iter().copied().enumerate() {
-            let position = (chunk_index * prompt_batch_limit + offset) as i32;
-            let is_last_prompt_token = chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
-
-            batch
-                .add(token, position, &[0], is_last_prompt_token)
-                .map_err(|e| format!("Batch add failed: {e}"))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| format!("Prompt decode failed: {e}"))?;
-    }
-
-    sample_tokens(
+    sample_tokens_from_pos(
         model,
         &mut ctx,
         &mut batch,
@@ -341,124 +923,8 @@ fn run_inference_inner(
         req,
         stream_tx,
         prompt_tokens,
+        n_past as i32,
     )
-}
-
-#[cfg(feature = "mtmd")]
-fn run_inference_inner(
-    backend: &llama_cpp_2::llama_backend::LlamaBackend,
-    model: &llama_cpp_2::model::LlamaModel,
-    n_ctx: u32,
-    kv_cache: &KvCacheParams,
-    req: &InferenceParams,
-    stream_tx: Option<&StreamSender>,
-    mtmd_ctx: Option<&llama_cpp_2::mtmd::MtmdContext>,
-) -> Result<InferenceResult, String> {
-    use llama_cpp_2::context::params::LlamaContextParams;
-    use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
-
-    let prompt_build = build_prompt(model, &req.prepared_request)?;
-    let prompt = prompt_build.prompt.as_str();
-
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
-        .with_type_k(kv_cache.type_k)
-        .with_type_v(kv_cache.type_v);
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .map_err(|e| format!("Context creation failed: {e}"))?;
-
-    let has_images = !req.prepared_request.images.is_empty();
-
-    if has_images && mtmd_ctx.is_some() {
-        let mtmd = mtmd_ctx.unwrap();
-
-        // Create bitmaps from raw image bytes
-        let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
-            .prepared_request
-            .images
-            .iter()
-            .map(|bytes| {
-                llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, bytes)
-                    .map_err(|e| format!("Failed to create bitmap from image data: {e}"))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let bitmap_refs: Vec<&llama_cpp_2::mtmd::MtmdBitmap> = bitmaps.iter().collect();
-
-        let text_input = llama_cpp_2::mtmd::MtmdInputText {
-            text: prompt.to_string(),
-            add_special: true,
-            parse_special: true,
-        };
-
-        let chunks = mtmd
-            .tokenize(text_input, &bitmap_refs)
-            .map_err(|e| format!("Multimodal tokenization failed: {e}"))?;
-
-        let prompt_tokens = chunks.total_tokens() as u64;
-        let n_batch = ctx.n_batch() as i32;
-
-        let n_past = chunks
-            .eval_chunks(mtmd, &ctx, 0, 0, n_batch, true)
-            .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
-
-        // Set up batch for sampling — we need a batch positioned at n_past
-        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
-        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
-
-        // After eval_chunks, the context is ready for sampling.
-        // We need to set n_cur to n_past for the sampling loop.
-        // The batch from eval_chunks already set logits_last=true, so we can sample directly.
-        sample_tokens_from_pos(
-            model,
-            &mut ctx,
-            &mut batch,
-            &prompt_build,
-            req,
-            stream_tx,
-            prompt_tokens,
-            n_past as i32,
-        )
-    } else {
-        // Standard text-only path
-        let tokens = model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| format!("Tokenization failed: {e}"))?;
-        let prompt_tokens = tokens.len() as u64;
-
-        let prompt_len = tokens.len();
-        let prompt_batch_limit = ctx.n_batch().max(1) as usize;
-        let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
-
-        for (chunk_index, chunk) in tokens.chunks(prompt_batch_limit).enumerate() {
-            batch.clear();
-
-            for (offset, token) in chunk.iter().copied().enumerate() {
-                let position = (chunk_index * prompt_batch_limit + offset) as i32;
-                let is_last_prompt_token =
-                    chunk_index * prompt_batch_limit + offset + 1 == prompt_len;
-
-                batch
-                    .add(token, position, &[0], is_last_prompt_token)
-                    .map_err(|e| format!("Batch add failed: {e}"))?;
-            }
-
-            ctx.decode(&mut batch)
-                .map_err(|e| format!("Prompt decode failed: {e}"))?;
-        }
-
-        sample_tokens(
-            model,
-            &mut ctx,
-            &mut batch,
-            &prompt_build,
-            req,
-            stream_tx,
-            prompt_tokens,
-        )
-    }
 }
 
 /// Build a set of token IDs that should be decoded with `special = true`.
@@ -646,6 +1112,9 @@ fn sample_tokens_from_pos(
     prompt_tokens: u64,
     n_past: i32,
 ) -> Result<InferenceResult, String> {
+    // Image-path inference uses a throwaway context, so nothing was served
+    // from a persistent prefix cache.
+    let cached_input_tokens = 0u64;
     let SamplerChain {
         mut sampler,
         has_grammar,
@@ -772,6 +1241,7 @@ fn sample_tokens_from_pos(
         choice,
         prompt_tokens,
         completion_tokens,
+        cached_input_tokens,
     })
 }
 
@@ -783,6 +1253,8 @@ fn sample_tokens(
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
+    cached_input_tokens: u64,
+    last_tokens: &mut Vec<llama_cpp_2::token::LlamaToken>,
 ) -> Result<InferenceResult, String> {
     let SamplerChain {
         mut sampler,
@@ -864,6 +1336,9 @@ fn sample_tokens(
             .map_err(|e| format!("Batch add failed: {e}"))?;
         ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
+        // Track tokens that are now committed to the KV cache so the next
+        // request can detect the longest common prefix correctly.
+        last_tokens.push(token);
         n_cur += 1;
     }
 
@@ -905,6 +1380,7 @@ fn sample_tokens(
         choice,
         prompt_tokens,
         completion_tokens,
+        cached_input_tokens,
     })
 }
 

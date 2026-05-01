@@ -1,6 +1,6 @@
 use rig::client::CompletionClient;
 use rig::completion::TypedPrompt;
-use rig_llama_cpp::{Client, FitParams, KvCacheParams, SamplingParams};
+use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -23,6 +23,7 @@ async fn main() -> Result<(), anyhow::Error> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
 
     let agent = client

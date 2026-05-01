@@ -1,6 +1,6 @@
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig_llama_cpp::{Client, FitParams, KvCacheParams, SamplingParams};
+use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -15,6 +15,7 @@ async fn main() -> Result<(), anyhow::Error> {
         SamplingParams::default(),
         FitParams::default(),
         KvCacheParams::default(),
+        CheckpointParams::default(),
     )?;
 
     let response_a = client
@@ -36,6 +37,7 @@ async fn main() -> Result<(), anyhow::Error> {
             SamplingParams::default(),
             FitParams::default(),
             KvCacheParams::default(),
+            CheckpointParams::default(),
         )
         .map_err(anyhow::Error::msg)?;
 
