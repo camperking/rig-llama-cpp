@@ -103,7 +103,17 @@ pub(crate) struct PreparedRequest {
     pub json_schema: Option<String>,
     pub enable_thinking: bool,
     #[cfg(feature = "mtmd")]
-    pub images: Vec<Vec<u8>>,
+    pub images: Vec<PreparedImage>,
+}
+
+/// One image extracted from the chat history with its FNV-1a hash precomputed.
+/// The hash is propagated into the underlying `MtmdBitmap` via `set_id` so
+/// that `MtmdInputChunk::id()` round-trips it for the prefix-cache diff.
+#[cfg(feature = "mtmd")]
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedImage {
+    pub bytes: Vec<u8>,
+    pub hash: u64,
 }
 
 pub(crate) struct PromptBuildResult {

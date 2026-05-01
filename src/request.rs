@@ -3,6 +3,10 @@ use rig::message::{AssistantContent, Message, ToolCall, UserContent};
 use rig::one_or_many::OneOrMany;
 use serde_json::{Value, json};
 
+#[cfg(feature = "mtmd")]
+use crate::slot::fnv1a_64;
+#[cfg(feature = "mtmd")]
+use crate::types::PreparedImage;
 use crate::types::PreparedRequest;
 
 /// Normalize a tool result's content list. rig-core 0.35.0's streaming agent
@@ -116,7 +120,10 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
                 for item in content.iter() {
                     match item {
                         UserContent::Image(image) => match extract_image_bytes(image) {
-                            Ok(bytes) => imgs.push(bytes),
+                            Ok(bytes) => {
+                                let hash = fnv1a_64(&bytes);
+                                imgs.push(PreparedImage { bytes, hash });
+                            }
                             Err(e) => return Err(format!("Image extraction failed: {e}")),
                         },
                         UserContent::ToolResult(tool_result) => {
@@ -127,7 +134,10 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
                             for part in normalized_tool_parts(&tool_result.content) {
                                 if let rig::message::ToolResultContent::Image(image) = part {
                                     match extract_image_bytes(&image) {
-                                        Ok(bytes) => imgs.push(bytes),
+                                        Ok(bytes) => {
+                                            let hash = fnv1a_64(&bytes);
+                                            imgs.push(PreparedImage { bytes, hash });
+                                        }
                                         Err(e) => {
                                             return Err(format!(
                                                 "Tool-result image extraction failed: {e}"

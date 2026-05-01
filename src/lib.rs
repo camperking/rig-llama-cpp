@@ -38,7 +38,7 @@
 //! ```rust,no_run
 //! use rig::client::CompletionClient;
 //! use rig::completion::Prompt;
-//! use rig_llama_cpp::{FitParams, KvCacheParams, SamplingParams};
+//! use rig_llama_cpp::{CheckpointParams, FitParams, KvCacheParams, SamplingParams};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), anyhow::Error> {
@@ -48,6 +48,7 @@
 //!     SamplingParams::default(),
 //!     FitParams::default(),
 //!     KvCacheParams::default(),
+//!     CheckpointParams::default(),
 //! )?;
 //!
 //! let agent = client
@@ -65,6 +66,7 @@
 mod types;
 mod client;
 mod request;
+mod slot;
 mod worker;
 mod parsing;
 mod embedding;
