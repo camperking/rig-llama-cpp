@@ -1,6 +1,18 @@
+<div align="center">
+
 # rig-llama-cpp
 
+**Run GGUF models locally inside your [Rig](https://github.com/0xPlaygrounds/rig) agents.**
+
+[![crates.io](https://img.shields.io/crates/v/rig-llama-cpp.svg)](https://crates.io/crates/rig-llama-cpp)
+[![docs.rs](https://img.shields.io/docsrs/rig-llama-cpp)](https://docs.rs/rig-llama-cpp)
+[![license](https://img.shields.io/crates/l/rig-llama-cpp.svg)](#license)
+[![ci](https://img.shields.io/github/actions/workflow/status/camperking/rig-llama-cpp/ci.yml?branch=master&label=CI)](https://github.com/camperking/rig-llama-cpp/actions/workflows/ci.yml)
+
+</div>
+
 A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF models locally via [llama.cpp](https://github.com/ggml-org/llama.cpp) and their Rust bindings [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs).
+Drop it in wherever you'd use a cloud provider — same `CompletionModel` trait, same agent API, but inference happens on your hardware with no API keys, no rate limits, and no data leaving the machine.
 
 ## Usage
 
@@ -142,4 +154,4 @@ top of that file.
 
 ## License
 
-See [Cargo.toml](Cargo.toml) for dependency details.
+Licensed under the [MIT License](LICENSE). See [Cargo.toml](Cargo.toml) for dependency details.
