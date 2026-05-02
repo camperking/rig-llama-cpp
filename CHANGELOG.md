@@ -20,6 +20,15 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.1.1] — 2026-05-02
+
+### Changed
+
+- **README polish.** Centered the title, added a tagline, surfaced
+  crates.io / docs.rs / license / CI shields.io badges, expanded the
+  intro paragraph, and named MIT explicitly in the License section.
+  No code changes.
+
 ## [0.1.0] — 2026-05-01
 
 Initial public release.
