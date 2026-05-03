@@ -12,7 +12,7 @@ use serial_test::serial;
 
 use super::common::{
     QWEN, completion_with_thinking, ensure_model, env_parse_u32, load_default, run_long_e2e,
-    tool_roundtrip,
+    run_streamed_structured, tool_roundtrip,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -152,4 +152,67 @@ async fn vision_basic_qwen() -> anyhow::Result<()> {
     let model_path = ensure_model(&QWEN)?;
     let mmproj_path = ensure_model(&super::common::QWEN_MMPROJ)?;
     super::common::run_vision(&model_path, &mmproj_path).await
+}
+
+/// Streaming structured-output over a runtime-built schema. Mirrors the
+/// path `chatty` takes for workflow agents (schema set on
+/// `AgentBuilder`, response consumed via `stream_chat`, accumulated
+/// text parsed as JSON afterwards). Regression guard: previously
+/// passed for Qwen but broke on Gemma; we keep both tests so divergence
+/// surfaces here next time.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(model)]
+#[ignore = "downloads Qwen 3.5-2B and validates streaming structured output"]
+async fn qwen_structured_output_streaming() -> anyhow::Result<()> {
+    let path = ensure_model(&QWEN)?;
+    let (client, _model) = load_default(&path)?;
+
+    // Runtime-built schema (matches what chatty produces from its
+    // `Vec<SchemaField>`), not a `derive(JsonSchema)` type.
+    let schema_value = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "age": { "type": "number" },
+            "occupation": { "type": "string" }
+        },
+        "required": ["name", "age", "occupation"],
+        "additionalProperties": false,
+    });
+    let schema = schemars::Schema::try_from(schema_value)?;
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Person {
+        name: String,
+        age: u32,
+        occupation: String,
+    }
+
+    let outcome = run_streamed_structured::<Person>(
+        &client,
+        schema,
+        "Extract the single person described in the user's text as structured JSON. Respond with the JSON object only.",
+        "Ada is a 36-year-old software engineer living in Berlin.",
+    )
+    .await?;
+
+    println!(
+        "qwen_structured_output_streaming: chunks={}, raw_len={}, parsed_ok={}, raw={:?}",
+        outcome.chunk_count,
+        outcome.raw.len(),
+        outcome.parsed_ok,
+        outcome.raw,
+    );
+    ensure!(
+        outcome.chunk_count > 0,
+        "Qwen streaming structured output: no text chunks emitted"
+    );
+    ensure!(
+        outcome.parsed_ok,
+        "Qwen streaming structured output failed to parse: {:?} — raw was {:?}",
+        outcome.parse_error,
+        outcome.raw
+    );
+    Ok(())
 }

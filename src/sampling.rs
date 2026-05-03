@@ -5,7 +5,7 @@ use rig::message::AssistantContent;
 use rig::one_or_many::OneOrMany;
 use rig::streaming::RawStreamingChoice;
 
-use crate::parsing::parse_completion_output;
+use crate::parsing::{extract_structured_json, parse_completion_output};
 use crate::slot::SlotEntry;
 use crate::types::{
     InferenceParams, InferenceResult, PromptBuildResult, SamplerChain, StreamDeltaState,
@@ -223,7 +223,11 @@ pub(crate) fn sample_tokens_from_pos(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut completion_tokens = 0u64;
 
-    let mut stream_parser = if stream_tx.is_some() {
+    // See `sample_tokens` for the rationale: bypass the OAI streaming
+    // parser when a `json_schema` is set; it buffers grammar-constrained
+    // JSON output and crashes on flush, dropping every chunk.
+    let bypass_oai_parser = req.prepared_request.json_schema.is_some();
+    let mut stream_parser = if stream_tx.is_some() && !bypass_oai_parser {
         prompt_build
             .template_result
             .as_ref()
@@ -278,7 +282,9 @@ pub(crate) fn sample_tokens_from_pos(
             break;
         }
 
-        if let Some(tx) = stream_tx {
+        if let Some(tx) = stream_tx
+            && !bypass_oai_parser
+        {
             if let Some(parser) = stream_parser.as_mut() {
                 match parser.update(&piece, true) {
                     Ok(deltas) => {
@@ -310,22 +316,32 @@ pub(crate) fn sample_tokens_from_pos(
 
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
-        if let Some(parser) = stream_parser.as_mut()
-            && let Ok(deltas) = parser.update("", false)
-        {
-            for delta_json in deltas {
-                for choice in delta_state.parse_delta(&delta_json) {
-                    let _ = tx.send(Ok(choice));
+        if !bypass_oai_parser {
+            if let Some(parser) = stream_parser.as_mut()
+                && let Ok(deltas) = parser.update("", false)
+            {
+                for delta_json in deltas {
+                    for choice in delta_state.parse_delta(&delta_json) {
+                        let _ = tx.send(Ok(choice));
+                    }
                 }
             }
-        }
-        for choice in delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref()) {
-            let _ = tx.send(Ok(choice));
+            for choice in
+                delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref())
+            {
+                let _ = tx.send(Ok(choice));
+            }
+        } else if let Some(json) = extract_structured_json(&output) {
+            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
         }
     }
 
     let choice = if stream_tx.is_some() {
-        OneOrMany::one(AssistantContent::text(output.clone()))
+        if bypass_oai_parser && let Some(json) = extract_structured_json(&output) {
+            OneOrMany::one(AssistantContent::text(json))
+        } else {
+            OneOrMany::one(AssistantContent::text(output.clone()))
+        }
     } else {
         parse_completion_output(
             &output,
@@ -368,8 +384,16 @@ pub(crate) fn sample_tokens(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut completion_tokens = 0u64;
 
-    // Initialize streaming parser if streaming and we have a template result
-    let mut stream_parser = if stream_tx.is_some() {
+    // The OAI streaming parser silently buffers content while
+    // `is_partial=true` and crashes on flush (`FfiError(-3)`) when the
+    // payload is grammar-constrained JSON — we lose every chunk. Until
+    // upstream `llama.cpp`'s `llama_rs_chat_parse_state_*` is fixed,
+    // bypass the parser entirely when a `json_schema` is set: stream
+    // the raw pieces and let `extract_structured_json` clean up role
+    // markers (`<|im_start|>assistant\n\n…`) and trailing junk at the
+    // end as a single corrective chunk.
+    let bypass_oai_parser = req.prepared_request.json_schema.is_some();
+    let mut stream_parser = if stream_tx.is_some() && !bypass_oai_parser {
         prompt_build
             .template_result
             .as_ref()
@@ -416,7 +440,9 @@ pub(crate) fn sample_tokens(
             break;
         }
 
-        if let Some(tx) = stream_tx {
+        if let Some(tx) = stream_tx
+            && !bypass_oai_parser
+        {
             if let Some(parser) = stream_parser.as_mut() {
                 match parser.update(&piece, true) {
                     Ok(deltas) => {
@@ -450,25 +476,44 @@ pub(crate) fn sample_tokens(
 
     // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
-        if let Some(parser) = stream_parser.as_mut()
-            && let Ok(deltas) = parser.update("", false)
-        {
-            for delta_json in deltas {
-                for choice in delta_state.parse_delta(&delta_json) {
-                    let _ = tx.send(Ok(choice));
+        if !bypass_oai_parser {
+            if let Some(parser) = stream_parser.as_mut()
+                && let Ok(deltas) = parser.update("", false)
+            {
+                for delta_json in deltas {
+                    for choice in delta_state.parse_delta(&delta_json) {
+                        let _ = tx.send(Ok(choice));
+                    }
                 }
             }
-        }
-        // Emit complete tool calls so they get accumulated into assistant_items
-        for choice in delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref()) {
-            let _ = tx.send(Ok(choice));
+            // Emit complete tool calls so they get accumulated into assistant_items
+            for choice in
+                delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref())
+            {
+                let _ = tx.send(Ok(choice));
+            }
+        } else if let Some(json) = extract_structured_json(&output) {
+            // Single corrective chunk for the structured-output path:
+            // chat templates with `add_generation_prompt: true` plus a
+            // grammar that fires lazily can leak the assistant role
+            // header (`<|im_start|>assistant\n\n`) into the model's
+            // own output. Strip it (and any trailing junk) so the
+            // accumulated stream is parseable JSON.
+            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
         }
     }
 
     let choice = if stream_tx.is_some() {
         // For streaming, choice was already sent through the stream;
-        // return a minimal placeholder for InferenceResult
-        OneOrMany::one(AssistantContent::text(output.clone()))
+        // return a minimal placeholder for InferenceResult. When the
+        // payload is structured, prefer the cleaned JSON so non-stream
+        // consumers of `InferenceResult.text` see the same canonical
+        // form the stream emitted.
+        if bypass_oai_parser && let Some(json) = extract_structured_json(&output) {
+            OneOrMany::one(AssistantContent::text(json))
+        } else {
+            OneOrMany::one(AssistantContent::text(output.clone()))
+        }
     } else {
         parse_completion_output(
             &output,

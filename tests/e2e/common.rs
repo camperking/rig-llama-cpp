@@ -17,7 +17,7 @@ use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
 use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, Model, SamplingParams};
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -474,6 +474,72 @@ pub async fn tool_roundtrip(model: &Model) -> anyhow::Result<(String, String)> {
 
     let text = assistant_text(&follow_up.choice);
     Ok((tool_name, text))
+}
+
+/// Diagnostic record from one structured-output streaming run.
+///
+/// Tests assert on `parsed_ok`, but `raw` and `chunk_count` are
+/// printed regardless to make failures actionable: an empty `raw`
+/// (typical Gemma symptom) indicates the model never emitted any
+/// content tokens, while a non-empty `raw` that fails parsing is a
+/// formatting issue we can extract from.
+#[derive(Debug)]
+pub struct StreamedStructuredOutcome {
+    pub raw: String,
+    pub chunk_count: usize,
+    pub parsed_ok: bool,
+    pub parse_error: Option<String>,
+}
+
+/// Run a structured-output prompt over the **streaming** path, mirroring
+/// the way `chatty` invokes us: schema set on the `AgentBuilder`,
+/// `.stream_chat()` consumed chunk-by-chunk, accumulated text parsed as
+/// JSON at the end. Returns the accumulated text, the chunk count, and
+/// whether the result deserialized into the requested type.
+///
+/// `schema` is the runtime-built `schemars::Schema` (so we exercise the
+/// same code path chatty does, where the schema is constructed from a
+/// runtime spec rather than `derive(JsonSchema)`).
+pub async fn run_streamed_structured<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    schema: schemars::Schema,
+    preamble: &str,
+    prompt: &str,
+) -> anyhow::Result<StreamedStructuredOutcome> {
+    let agent = client
+        .agent("local")
+        .preamble(preamble)
+        .max_tokens(256)
+        .temperature(0.2)
+        .output_schema_raw(schema)
+        .build();
+
+    use rig::agent::MultiTurnStreamItem;
+
+    let mut stream = agent.stream_chat(prompt, Vec::<Message>::new()).await;
+
+    let mut raw = String::new();
+    let mut chunk_count = 0usize;
+    while let Some(item) = stream.next().await {
+        if let MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) =
+            item?
+        {
+            raw.push_str(&text.text);
+            chunk_count += 1;
+        }
+    }
+
+    let (parsed_ok, parse_error) = match serde_json::from_str::<T>(raw.trim()) {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+
+    Ok(StreamedStructuredOutcome {
+        raw,
+        chunk_count,
+        parsed_ok,
+        parse_error,
+    })
 }
 
 /// Long-form streaming + completion + tool-call validation. Shared by the

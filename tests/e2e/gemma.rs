@@ -8,7 +8,8 @@ use serde::Deserialize;
 use serial_test::serial;
 
 use super::common::{
-    GEMMA, completion_with_thinking, ensure_model, load_default, run_long_e2e, tool_roundtrip,
+    GEMMA, completion_with_thinking, ensure_model, load_default, run_long_e2e,
+    run_streamed_structured, tool_roundtrip,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -115,4 +116,65 @@ async fn vision_basic_gemma() -> anyhow::Result<()> {
     let model_path = ensure_model(&GEMMA)?;
     let mmproj_path = ensure_model(&super::common::GEMMA_MMPROJ)?;
     super::common::run_vision(&model_path, &mmproj_path).await
+}
+
+/// Streaming structured-output over a runtime-built schema — the same
+/// path Gemma was failing on inside `chatty`'s workflow runtime
+/// ("structured response was not valid JSON: EOF while parsing a value
+/// at line 1 column 0", indicating an empty accumulated string). This
+/// regression test reproduces the issue against the real model so we
+/// can iterate a fix in `rig-llama-cpp`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(model)]
+#[ignore = "downloads Gemma-4 E4B and validates streaming structured output"]
+async fn gemma_structured_output_streaming() -> anyhow::Result<()> {
+    let path = ensure_model(&GEMMA)?;
+    let (client, _model) = load_default(&path)?;
+
+    let schema_value = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "age": { "type": "number" },
+            "occupation": { "type": "string" }
+        },
+        "required": ["name", "age", "occupation"],
+        "additionalProperties": false,
+    });
+    let schema = schemars::Schema::try_from(schema_value)?;
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Person {
+        name: String,
+        age: u32,
+        occupation: String,
+    }
+
+    let outcome = run_streamed_structured::<Person>(
+        &client,
+        schema,
+        "Extract the single person described in the user's text as structured JSON. Respond with the JSON object only.",
+        "Ada is a 36-year-old software engineer living in Berlin.",
+    )
+    .await?;
+
+    println!(
+        "gemma_structured_output_streaming: chunks={}, raw_len={}, parsed_ok={}, raw={:?}",
+        outcome.chunk_count,
+        outcome.raw.len(),
+        outcome.parsed_ok,
+        outcome.raw,
+    );
+    ensure!(
+        outcome.chunk_count > 0,
+        "Gemma streaming structured output: no text chunks emitted (likely the bug)"
+    );
+    ensure!(
+        outcome.parsed_ok,
+        "Gemma streaming structured output failed to parse: {:?} — raw was {:?}",
+        outcome.parse_error,
+        outcome.raw
+    );
+    Ok(())
 }

@@ -20,6 +20,30 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.1.3] — 2026-05-03
+
+### Fixed
+
+- **Streaming structured output silently swallowed every chunk.** When
+  a `json_schema` was set on the request and the stream path was used
+  (`agent.stream_chat(...)`), the OAI-compatible chat-template streaming
+  parser (`llama_rs_chat_parse_state_update_oaicompat`) buffered every
+  partial piece and then errored out on the final flush
+  (`FfiError(-3)`), leaving consumers with zero text chunks. End users
+  of crates like `chatty` saw `EOF while parsing a value at line 1
+  column 0` because the accumulated buffer was empty. We now bypass
+  that parser entirely whenever a `json_schema` is set: pieces still
+  accumulate into the inference buffer, and after the loop completes
+  we emit a single corrective chunk containing the result of
+  `extract_structured_json`. That strips any leading role markers a
+  template may leak (`<|im_start|>assistant\n\n…`) and any trailing
+  junk before the JSON is sent downstream. Reproduces against both
+  Qwen-3 and Gemma-4 — new e2e tests
+  `qwen_structured_output_streaming` /
+  `gemma_structured_output_streaming` (gated behind the existing
+  `--ignored` flag like the other model-bearing tests) keep this
+  honest.
+
 ## [0.1.2] — 2026-05-03
 
 ### Fixed
