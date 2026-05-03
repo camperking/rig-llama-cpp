@@ -20,6 +20,25 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.1.2] — 2026-05-03
+
+### Fixed
+
+- **Empty-piece tokens no longer abort generation.** When `llama.cpp`'s
+  `llama_token_to_piece` returns size 0 (control / unused / unknown-
+  attribute tokens like Qwen3's `<|object_ref_*|>` pair, or a
+  grammar-constrained sample landing on `<|fim_pad|>`), `llama-cpp-2`
+  surfaces it as `TokenToStringError::UnknownTokenType`. Previously the
+  sampling loop turned this into a hard error
+  (`Token to piece failed: Unknown Token Type`), aborting the whole
+  generation on the first such token. Canonical `llama.cpp` treats empty
+  pieces as "no text emitted, keep generating" — the token is still
+  consistent with the KV cache because we add it to the batch on the
+  next iteration. We now do the same: empty pieces are emitted as empty
+  strings and generation continues. Real errors
+  (`InsufficientBufferSpace`, `FromUtf8Error`, …) still propagate. New
+  unit tests in `sampling::tests` cover the three branches.
+
 ## [0.1.1] — 2026-05-02
 
 ### Changed

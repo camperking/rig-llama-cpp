@@ -52,6 +52,35 @@ fn get_additional_stops(
         .unwrap_or_default()
 }
 
+/// Convert a `token_to_piece` outcome into a piece-or-empty result.
+///
+/// `llama.cpp`'s `llama_token_to_piece` returns size 0 when the token has
+/// no printable representation — typically a control / unused / unknown-
+/// attribute token (e.g. `<|im_start|>`, `<|fim_pad|>`) that wasn't in
+/// the preserved set so `decode_special` was `false`. The `llama-cpp-2`
+/// wrapper surfaces that as `TokenToStringError::UnknownTokenType`.
+///
+/// Canonical `llama.cpp` (see `examples/main/main.cpp`) treats empty
+/// pieces as "no text to emit, keep generating" — the sampled token is
+/// still consistent with the KV cache because the caller appends it to
+/// the batch on the next iteration. Aborting the whole generation on
+/// the first such token (as the previous code did) means models with
+/// rare control tokens in their vocabulary — Qwen3's `<|object_ref_*|>`
+/// pair, structured-output sampling that lands on `<|fim_pad|>`, etc. —
+/// can fail mid-stream with `Token to piece failed: Unknown Token Type`.
+///
+/// Real errors (`InsufficientBufferSpace`, `FromUtf8Error`, …) still
+/// propagate so genuine bugs aren't silently swallowed.
+pub(crate) fn token_piece_or_empty(
+    result: Result<String, llama_cpp_2::TokenToStringError>,
+) -> Result<String, String> {
+    match result {
+        Ok(piece) => Ok(piece),
+        Err(llama_cpp_2::TokenToStringError::UnknownTokenType) => Ok(String::new()),
+        Err(other) => Err(format!("Token to piece failed: {other}")),
+    }
+}
+
 /// Escape regex metacharacters in a string (for Word-type grammar triggers).
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
@@ -234,9 +263,9 @@ pub(crate) fn sample_tokens_from_pos(
         }
 
         let decode_special = preserved_tokens.contains(&token);
-        let piece = model
-            .token_to_piece(token, &mut decoder, decode_special, None)
-            .map_err(|e| format!("Token to piece failed: {e}"))?;
+        let piece = token_piece_or_empty(
+            model.token_to_piece(token, &mut decoder, decode_special, None),
+        )?;
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -373,9 +402,9 @@ pub(crate) fn sample_tokens(
         }
 
         let decode_special = preserved_tokens.contains(&token);
-        let piece = model
-            .token_to_piece(token, &mut decoder, decode_special, None)
-            .map_err(|e| format!("Token to piece failed: {e}"))?;
+        let piece = token_piece_or_empty(
+            model.token_to_piece(token, &mut decoder, decode_special, None),
+        )?;
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -458,3 +487,40 @@ pub(crate) fn sample_tokens(
         cached_input_tokens,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_piece_or_empty_passes_ok_through() {
+        let result = token_piece_or_empty(Ok("hello".to_string()));
+        assert_eq!(result.as_deref(), Ok("hello"));
+    }
+
+    #[test]
+    fn token_piece_or_empty_swallows_unknown_token_type() {
+        // Control / unused / unknown-attribute tokens come back from
+        // llama.cpp as size 0, surfaced as UnknownTokenType. We map
+        // those to empty pieces so generation can continue rather than
+        // aborting on the first such token (regression for Qwen3-style
+        // vocabularies and grammar-constrained sampling that lands on
+        // a control token).
+        let result = token_piece_or_empty(Err(
+            llama_cpp_2::TokenToStringError::UnknownTokenType,
+        ));
+        assert_eq!(result.as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn token_piece_or_empty_propagates_real_errors() {
+        // InsufficientBufferSpace is a real failure (buffer too small);
+        // unlike UnknownTokenType it indicates a bug we want surfaced.
+        let result = token_piece_or_empty(Err(
+            llama_cpp_2::TokenToStringError::InsufficientBufferSpace(-32),
+        ));
+        let err = result.expect_err("expected error to propagate");
+        assert!(err.starts_with("Token to piece failed:"), "got: {err}");
+    }
+}
+
