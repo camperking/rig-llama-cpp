@@ -263,9 +263,8 @@ pub(crate) fn sample_tokens_from_pos(
         }
 
         let decode_special = preserved_tokens.contains(&token);
-        let piece = token_piece_or_empty(
-            model.token_to_piece(token, &mut decoder, decode_special, None),
-        )?;
+        let piece =
+            token_piece_or_empty(model.token_to_piece(token, &mut decoder, decode_special, None))?;
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -402,9 +401,8 @@ pub(crate) fn sample_tokens(
         }
 
         let decode_special = preserved_tokens.contains(&token);
-        let piece = token_piece_or_empty(
-            model.token_to_piece(token, &mut decoder, decode_special, None),
-        )?;
+        let piece =
+            token_piece_or_empty(model.token_to_piece(token, &mut decoder, decode_special, None))?;
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -506,9 +504,7 @@ mod tests {
         // aborting on the first such token (regression for Qwen3-style
         // vocabularies and grammar-constrained sampling that lands on
         // a control token).
-        let result = token_piece_or_empty(Err(
-            llama_cpp_2::TokenToStringError::UnknownTokenType,
-        ));
+        let result = token_piece_or_empty(Err(llama_cpp_2::TokenToStringError::UnknownTokenType));
         assert_eq!(result.as_deref(), Ok(""));
     }
 
@@ -523,4 +519,3 @@ mod tests {
         assert!(err.starts_with("Token to piece failed:"), "got: {err}");
     }
 }
-
