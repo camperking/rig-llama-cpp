@@ -81,6 +81,54 @@ pub(crate) fn token_piece_or_empty(
     }
 }
 
+/// Sample one token, working around llama-cpp-rs#1007 when grammar is present.
+///
+/// `LlamaSampler::sample(ctx, idx)` aborts via `GGML_ASSERT(!stacks.empty())`
+/// in `llama-grammar.cpp:940` on the first sample call when the chain
+/// contains `LlamaSampler::grammar(...)` — see
+/// <https://github.com/utilityai/llama-cpp-rs/issues/1007>. The reporter
+/// confirmed that applying the same chain to a manually-built
+/// `LlamaTokenDataArray` (built from `ctx.get_logits_ith(idx)`) does not
+/// crash, so when grammar is active we sample via that path instead.
+///
+/// `apply_sampler` does not internally call `accept()`, so the grammar
+/// branch must do so explicitly. The non-grammar branch keeps the
+/// existing legacy double-accept (`sample()` already accepts internally,
+/// then we accept again — the base samplers were calibrated against
+/// that behavior).
+///
+/// Remove this helper once upstream llama.cpp fixes the assert and
+/// llama-cpp-2 ships a release that resyncs to it.
+fn sample_one(
+    ctx: &llama_cpp_2::context::LlamaContext,
+    sampler: &mut llama_cpp_2::sampling::LlamaSampler,
+    idx: i32,
+    has_grammar: bool,
+) -> llama_cpp_2::token::LlamaToken {
+    use llama_cpp_2::token::{LlamaToken, data::LlamaTokenData, data_array::LlamaTokenDataArray};
+
+    if has_grammar {
+        let logits = ctx.get_logits_ith(idx);
+        let mut arr = LlamaTokenDataArray::from_iter(
+            logits
+                .iter()
+                .enumerate()
+                .map(|(id, &logit)| LlamaTokenData::new(LlamaToken(id as i32), logit, 0.0)),
+            false,
+        );
+        arr.apply_sampler(sampler);
+        let token = arr
+            .selected_token()
+            .expect("sampler chain failed to select a token");
+        sampler.accept(token);
+        token
+    } else {
+        let token = sampler.sample(ctx, idx);
+        sampler.accept(token);
+        token
+    }
+}
+
 /// Escape regex metacharacters in a string (for Word-type grammar triggers).
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
@@ -253,14 +301,7 @@ pub(crate) fn sample_tokens_from_pos(
         } else {
             batch.n_tokens() - 1
         };
-        let token = sampler.sample(ctx, sample_idx);
-        // sample() internally calls accept(). When there is no grammar sampler,
-        // accept again to preserve legacy double-accept that base samplers were
-        // calibrated with. Skip when grammar is present to avoid corrupting its
-        // parser state.
-        if !has_grammar {
-            sampler.accept(token);
-        }
+        let token = sample_one(ctx, &mut sampler, sample_idx, has_grammar);
 
         if model.is_eog_token(token) {
             break;
@@ -415,10 +456,7 @@ pub(crate) fn sample_tokens(
             break;
         }
 
-        let token = sampler.sample(ctx, batch.n_tokens() - 1);
-        if !has_grammar {
-            sampler.accept(token);
-        }
+        let token = sample_one(ctx, &mut sampler, batch.n_tokens() - 1, has_grammar);
 
         if model.is_eog_token(token) {
             break;

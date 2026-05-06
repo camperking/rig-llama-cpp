@@ -20,6 +20,30 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.1.4] — 2026-05-06
+
+### Fixed
+
+- **Avoided a `GGML_ASSERT(!stacks.empty())` abort in grammar-constrained
+  sampling.** Upstream
+  [llama-cpp-rs#1007](https://github.com/utilityai/llama-cpp-rs/issues/1007)
+  reports that `LlamaSampler::sample(ctx, idx)` aborts on the first
+  sample call whenever the chain contains `LlamaSampler::grammar(...)`,
+  even with a trivial `root ::= "a"` grammar (`llama-grammar.cpp:940`).
+  Both of our grammar consumers go through that API: tool-call grammar
+  from `ChatTemplateResult.grammar` and the GBNF that llama.cpp
+  synthesizes for `output_schema` / json_schema requests. We could not
+  reproduce the abort locally on Qwen3.5-2B Q4_K_M with the default
+  Vulkan backend, but the upstream API combination is identical and the
+  failure mode is `abort()` — not catchable from Rust — so we work
+  around it preemptively. When grammar is present we now sample via the
+  manual `LlamaTokenDataArray` + `apply_sampler` path that the issue
+  reporter confirmed is crash-free, and call `sampler.accept(token)`
+  explicitly (the manual path doesn't auto-accept the way `sample()`
+  does). The non-grammar hot path is unchanged. Removable once upstream
+  llama.cpp resolves the assert and `llama-cpp-2` ships a release that
+  resyncs to it — see the comment on `sample_one` in `src/sampling.rs`.
+
 ## [0.1.3] — 2026-05-03
 
 ### Fixed
