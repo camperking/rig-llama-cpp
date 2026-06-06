@@ -1,7 +1,7 @@
-use rig::completion::CompletionRequest;
-use rig::message::{AssistantContent, Message, ToolCall, UserContent};
+use rig_core::completion::CompletionRequest;
+use rig_core::message::{AssistantContent, Message, ToolCall, UserContent};
 #[cfg(feature = "mtmd")]
-use rig::one_or_many::OneOrMany;
+use rig_core::one_or_many::OneOrMany;
 use serde_json::{Value, json};
 
 #[cfg(feature = "mtmd")]
@@ -12,7 +12,7 @@ use crate::types::PreparedRequest;
 
 /// Normalize a tool result's content list. rig-core 0.35.0's streaming agent
 /// loop stored the raw tool-output string as plain `ToolResultContent::Text`
-/// in the chat history it sent to the next provider call, while its
+/// in the cha/usat history it sent to the next provider call, while its
 /// non-streaming counterpart called `ToolResultContent::from_tool_output` to
 /// parse image JSON into `Image` variants. Upstream rig-core 0.36.0 fixed
 /// this (see rig PR #1661 / issue #1650), so the streaming and non-streaming
@@ -27,13 +27,13 @@ use crate::types::PreparedRequest;
 /// can't be sent to the model anyway.
 #[cfg(feature = "mtmd")]
 fn normalized_tool_parts(
-    content: &OneOrMany<rig::message::ToolResultContent>,
-) -> Vec<rig::message::ToolResultContent> {
+    content: &OneOrMany<rig_core::message::ToolResultContent>,
+) -> Vec<rig_core::message::ToolResultContent> {
     let mut out = Vec::new();
     for part in content.iter() {
         match part {
-            rig::message::ToolResultContent::Text(t) => {
-                let parsed = rig::message::ToolResultContent::from_tool_output(t.text.clone());
+            rig_core::message::ToolResultContent::Text(t) => {
+                let parsed = rig_core::message::ToolResultContent::from_tool_output(t.text.clone());
                 for p in parsed.into_iter() {
                     out.push(p);
                 }
@@ -102,10 +102,10 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
 
     let tool_choice = match request.tool_choice.as_ref() {
         None => None,
-        Some(rig::message::ToolChoice::Auto) => Some("auto".to_string()),
-        Some(rig::message::ToolChoice::None) => Some("none".to_string()),
-        Some(rig::message::ToolChoice::Required) => Some("required".to_string()),
-        Some(rig::message::ToolChoice::Specific { .. }) => {
+        Some(rig_core::message::ToolChoice::Auto) => Some("auto".to_string()),
+        Some(rig_core::message::ToolChoice::None) => Some("none".to_string()),
+        Some(rig_core::message::ToolChoice::Required) => Some("required".to_string()),
+        Some(rig_core::message::ToolChoice::Specific { .. }) => {
             return Err("Specific tool choice is not supported by local llama adapter".into());
         }
     };
@@ -137,7 +137,7 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
                             // order media markers appear in `append_message_json`, so we
                             // walk the normalized parts here in the same iteration order.
                             for part in normalized_tool_parts(&tool_result.content) {
-                                if let rig::message::ToolResultContent::Image(image) = part {
+                                if let rig_core::message::ToolResultContent::Image(image) = part {
                                     match extract_image_bytes(&image) {
                                         Ok(bytes) => {
                                             let hash = fnv1a_64(&bytes);
@@ -299,7 +299,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                     let content = normalized
                         .iter()
                         .filter_map(|part| match part {
-                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            rig_core::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -310,7 +310,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                         .content
                         .iter()
                         .filter_map(|part| match part {
-                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            rig_core::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -319,7 +319,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                     #[cfg(feature = "mtmd")]
                     let image_count = normalized
                         .iter()
-                        .filter(|part| matches!(part, rig::message::ToolResultContent::Image(_)))
+                        .filter(|part| matches!(part, rig_core::message::ToolResultContent::Image(_)))
                         .count();
 
                     #[cfg(feature = "mtmd")]
@@ -419,13 +419,13 @@ fn user_content_text(content: &UserContent) -> Option<String> {
     }
 }
 
-fn document_text(document: &rig::message::Document) -> String {
+fn document_text(document: &rig_core::message::Document) -> String {
     match &document.data {
-        rig::message::DocumentSourceKind::String(text)
-        | rig::message::DocumentSourceKind::Url(text)
-        | rig::message::DocumentSourceKind::Base64(text) => text.clone(),
-        rig::message::DocumentSourceKind::Raw(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        rig::message::DocumentSourceKind::Unknown => String::new(),
+        rig_core::message::DocumentSourceKind::String(text)
+        | rig_core::message::DocumentSourceKind::Url(text)
+        | rig_core::message::DocumentSourceKind::Base64(text) => text.clone(),
+        rig_core::message::DocumentSourceKind::Raw(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        rig_core::message::DocumentSourceKind::Unknown => String::new(),
         _ => String::new(),
     }
 }
@@ -450,8 +450,8 @@ fn tool_call_json(tool_call: &ToolCall) -> Value {
 }
 
 #[cfg(feature = "mtmd")]
-fn extract_image_bytes(image: &rig::message::Image) -> Result<Vec<u8>, String> {
-    use rig::message::DocumentSourceKind;
+fn extract_image_bytes(image: &rig_core::message::Image) -> Result<Vec<u8>, String> {
+    use rig_core::message::DocumentSourceKind;
     match &image.data {
         DocumentSourceKind::Raw(bytes) => Ok(bytes.clone()),
         DocumentSourceKind::Base64(encoded) => {

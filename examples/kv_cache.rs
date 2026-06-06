@@ -1,5 +1,5 @@
-use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::Prompt;
 use rig_llama_cpp::{Client, KvCacheParams, KvCacheType};
 
 #[tokio::main]

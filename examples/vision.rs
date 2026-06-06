@@ -9,10 +9,10 @@ fn main() {
 #[cfg(feature = "mtmd")]
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    use rig::OneOrMany;
-    use rig::client::CompletionClient;
-    use rig::completion::CompletionModel;
-    use rig::message::{DocumentSourceKind, Image, ImageMediaType, Message, UserContent};
+    use rig_core::OneOrMany;
+    use rig_core::client::CompletionClient;
+    use rig_core::completion::CompletionModel;
+    use rig_core::message::{DocumentSourceKind, Image, ImageMediaType, Message, UserContent};
     use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 
     let model_path =

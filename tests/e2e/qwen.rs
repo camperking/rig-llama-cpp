@@ -1,8 +1,8 @@
 //! Qwen 3.5-2B integration tests.
 
 use anyhow::ensure;
-use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, TypedPrompt};
+use rig_core::client::CompletionClient;
+use rig_core::completion::{CompletionModel, TypedPrompt};
 use rig_llama_cpp::{
     CheckpointParams, Client, FitParams, KvCacheParams, KvCacheType, SamplingParams,
 };

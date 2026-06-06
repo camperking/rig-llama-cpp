@@ -1,6 +1,6 @@
 [package]
 name = "rig-llama-cpp"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.88"
 description = "Rig completion provider for local GGUF models via llama.cpp, with streaming, tool calling, reasoning, and multimodal (mtmd) support."
@@ -37,7 +37,7 @@ rocm = ["llama-cpp-2/rocm"]
 mtmd = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
-rig-core = "0.36.0"
+rig-core = "0.38.1"
 llama-cpp-2 = { version = "0.1.146", default-features = false }
 llama-cpp-sys-2 = { version = "0.1.146", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
@@ -53,7 +53,7 @@ base64 = { version = "0.22", optional = true }
 [dev-dependencies]
 schemars = "1"
 anyhow = "1"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "native-tls"] }
 # Forces e2e tests to run sequentially. Cargo's default test runner is
 # parallel, but loading multiple GGUF models at once OOMs the GPU and
 # concurrent first-time hf-hub downloads of the same file race the

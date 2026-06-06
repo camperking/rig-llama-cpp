@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rig::message::AssistantContent;
-use rig::one_or_many::OneOrMany;
-use rig::streaming::RawStreamingChoice;
+use rig_core::message::AssistantContent;
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::RawStreamingChoice;
 
 use crate::parsing::{extract_structured_json, parse_completion_output};
 use crate::slot::SlotEntry;

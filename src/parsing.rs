@@ -1,6 +1,6 @@
-use rig::message::{AssistantContent, Reasoning, ToolCall, ToolFunction};
-use rig::one_or_many::OneOrMany;
-use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolFunction};
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 use serde_json::Value;
 
 use crate::types::{StreamChunk, StreamDeltaState};

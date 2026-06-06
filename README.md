@@ -17,8 +17,8 @@ Drop it in wherever you'd use a cloud provider — same `CompletionModel` trait,
 ## Usage
 
 ```rust
-use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::Prompt;
 use rig_llama_cpp::Client;
 
 #[tokio::main]
@@ -60,15 +60,15 @@ available for callers pinned to the 0.1.x API.
 
 No default GPU backend — pick the one that matches your hardware:
 
-| Feature  | Use for                                                          |
-| -------- | ---------------------------------------------------------------- |
-| _(none)_ | CPU-only inference                                               |
-| `vulkan` | Cross-vendor GPU on Linux/Windows                                |
-| `cuda`   | NVIDIA GPUs                                                      |
-| `metal`  | Apple Silicon / macOS                                            |
-| `rocm`   | AMD GPUs on Linux                                                |
-| `openmp` | OpenMP CPU threading; combine with any GPU backend               |
-| `mtmd`   | Multimodal (vision) inference; enables `ClientBuilder::mmproj`   |
+| Feature  | Use for                                                        |
+|----------|----------------------------------------------------------------|
+| _(none)_ | CPU-only inference                                             |
+| `vulkan` | Cross-vendor GPU on Linux/Windows                              |
+| `cuda`   | NVIDIA GPUs                                                    |
+| `metal`  | Apple Silicon / macOS                                          |
+| `rocm`   | AMD GPUs on Linux                                              |
+| `openmp` | OpenMP CPU threading; combine with any GPU backend             |
+| `mtmd`   | Multimodal (vision) inference; enables `ClientBuilder::mmproj` |
 
 ```sh
 cargo build --features vulkan

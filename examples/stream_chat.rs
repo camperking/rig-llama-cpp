@@ -1,7 +1,7 @@
-use rig::client::CompletionClient;
-use rig::message::Message;
-use rig::streaming::StreamingChat;
-use rig::tool::ToolDyn;
+use rig_core::client::CompletionClient;
+use rig_core::message::Message;
+use rig_core::streaming::StreamingChat;
+use rig_core::tool::ToolDyn;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde_json::json;
 

@@ -1,4 +1,4 @@
-use rig::embeddings::EmbeddingModel;
+use rig_core::embeddings::EmbeddingModel;
 use rig_llama_cpp::EmbeddingClient;
 
 #[tokio::main]
