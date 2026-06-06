@@ -13,11 +13,11 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, ensure};
 use hf_hub::api::sync::Api;
-use rig::OneOrMany;
-use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
-use rig::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
-use rig::streaming::{StreamedAssistantContent, StreamingChat};
+use rig_core::OneOrMany;
+use rig_core::client::CompletionClient;
+use rig_core::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
+use rig_core::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
+use rig_core::streaming::{StreamedAssistantContent, StreamingChat};
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, Model, SamplingParams};
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -514,7 +514,7 @@ pub async fn run_streamed_structured<T: serde::de::DeserializeOwned>(
         .output_schema_raw(schema)
         .build();
 
-    use rig::agent::MultiTurnStreamItem;
+    use rig_core::agent::MultiTurnStreamItem;
 
     let mut stream = agent.stream_chat(prompt, Vec::<Message>::new()).await;
 
@@ -660,8 +660,8 @@ pub async fn run_long_e2e(model_path: &std::path::Path) -> anyhow::Result<()> {
 // ── Vision (mtmd-only) helpers ───────────────────────────────────────
 
 #[cfg(feature = "mtmd")]
-pub fn detect_image_media_type(path: &std::path::Path) -> rig::message::ImageMediaType {
-    use rig::message::ImageMediaType;
+pub fn detect_image_media_type(path: &std::path::Path) -> rig_core::message::ImageMediaType {
+    use rig_core::message::ImageMediaType;
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -681,7 +681,7 @@ pub async fn run_vision(
     model_path: &std::path::Path,
     mmproj_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    use rig::message::{DocumentSourceKind, Image};
+    use rig_core::message::{DocumentSourceKind, Image};
 
     ensure!(
         model_path.is_file(),

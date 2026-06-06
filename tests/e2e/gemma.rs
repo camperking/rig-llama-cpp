@@ -1,8 +1,8 @@
 //! Gemma-4 E4B integration tests.
 
 use anyhow::ensure;
-use rig::client::CompletionClient;
-use rig::completion::TypedPrompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::TypedPrompt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serial_test::serial;

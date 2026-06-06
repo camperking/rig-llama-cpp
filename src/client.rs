@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use rig::client::CompletionClient;
-use rig::completion::{
+use rig_core::client::CompletionClient;
+use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
 };
-use rig::streaming::StreamingCompletionResponse;
+use rig_core::streaming::StreamingCompletionResponse;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -470,6 +470,8 @@ impl CompletionModel for Model {
                 total_tokens: result.prompt_tokens + result.completion_tokens,
                 cached_input_tokens: result.cached_input_tokens,
                 cache_creation_input_tokens: 0,
+                tool_use_prompt_tokens: 0,
+                reasoning_tokens: 0,
             },
             raw_response: RawResponse { text: result.text },
             message_id: None,

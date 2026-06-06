@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use rig::completion::{CompletionError, GetTokenUsage, Usage};
-use rig::message::AssistantContent;
-use rig::one_or_many::OneOrMany;
-use rig::streaming::{RawStreamingChoice, RawStreamingToolCall};
+use rig_core::completion::{CompletionError, GetTokenUsage, Usage};
+use rig_core::message::AssistantContent;
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::{RawStreamingChoice, RawStreamingToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -49,6 +49,8 @@ impl GetTokenUsage for StreamChunk {
             total_tokens: input + output,
             cached_input_tokens: self.cached_input_tokens.unwrap_or(0),
             cache_creation_input_tokens: 0,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 0,
         })
     }
 }

@@ -1,5 +1,5 @@
-use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::Prompt;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 
 #[tokio::main]

@@ -1,7 +1,7 @@
 //! Embedding integration test.
 
 use anyhow::ensure;
-use rig::embeddings::EmbeddingModel as _;
+use rig_core::embeddings::EmbeddingModel as _;
 use rig_llama_cpp::EmbeddingClient;
 use serial_test::serial;
 

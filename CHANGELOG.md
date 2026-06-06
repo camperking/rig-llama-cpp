@@ -102,8 +102,8 @@ Initial public release.
 
 ### Highlights
 
-- **Rig integration.** Implements `rig::client::CompletionClient` /
-  `rig::completion::CompletionModel` and the matching embedding traits, so
+- **Rig integration.** Implements `rig_core::client::CompletionClient` /
+  `rig_core::completion::CompletionModel` and the matching embedding traits, so
   any GGUF model is a drop-in for cloud Rig providers.
 - **Local GGUF inference.** Any architecture supported by upstream
   `llama-cpp-2` (`0.1.146`).

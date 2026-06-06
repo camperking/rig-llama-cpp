@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::thread;
 
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
+use rig_core::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::LoadError;
@@ -19,11 +19,11 @@ struct EmbeddingRequest {
 /// The llama.cpp embedding client.
 ///
 /// `EmbeddingClient` loads a GGUF embedding model on a dedicated worker thread
-/// and exposes it through Rig's [`rig::embeddings::EmbeddingModel`] trait.
+/// and exposes it through Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
 /// Create one with [`EmbeddingClient::from_gguf`].
 ///
 /// ```rust,no_run
-/// use rig::embeddings::EmbeddingModel;
+/// use rig_core::embeddings::EmbeddingModel;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,7 +106,7 @@ impl Drop for EmbeddingClient {
     }
 }
 
-/// A handle to a loaded embedding model that implements Rig's [`rig::embeddings::EmbeddingModel`] trait.
+/// A handle to a loaded embedding model that implements Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
 ///
 /// Obtained via [`EmbeddingClient::embedding_model`].
 #[derive(Clone)]
@@ -117,7 +117,7 @@ pub struct EmbeddingModelHandle {
     model_id: String,
 }
 
-impl rig::embeddings::EmbeddingModel for EmbeddingModelHandle {
+impl rig_core::embeddings::EmbeddingModel for EmbeddingModelHandle {
     const MAX_DOCUMENTS: usize = 256;
     type Client = EmbeddingClient;
 
