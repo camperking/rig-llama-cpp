@@ -1,74 +1,24 @@
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rig::message::AssistantContent;
-use rig::one_or_many::OneOrMany;
-use rig::streaming::RawStreamingChoice;
+use rig_core::message::{AssistantContent, ToolCall, ToolFunction};
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::{RawStreamingChoice, RawStreamingToolCall};
 
-use crate::parsing::{extract_structured_json, parse_completion_output};
+use crate::parsing::{extract_structured_json, parse_completion_output, parse_tool_calls};
 use crate::slot::SlotEntry;
-use crate::types::{
-    InferenceParams, InferenceResult, PromptBuildResult, SamplerChain, StreamDeltaState,
-    StreamSender,
-};
+use crate::types::{InferenceParams, InferenceResult, PromptBuildResult, StreamSender};
 use crate::worker::CANCEL_ERR;
-
-fn build_preserved_token_set(
-    model: &llama_cpp_2::model::LlamaModel,
-    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
-) -> HashSet<llama_cpp_2::token::LlamaToken> {
-    use llama_cpp_2::model::AddBos;
-
-    let mut set = HashSet::new();
-    let Some(tr) = template_result else {
-        return set;
-    };
-    for token_str in &tr.preserved_tokens {
-        if let Ok(ids) = model.str_to_token(token_str, AddBos::Never) {
-            if ids.len() == 1 {
-                set.insert(ids[0]);
-            } else {
-                log::debug!(
-                    "preserved token {token_str:?} tokenized to {} ids (expected 1), skipping",
-                    ids.len()
-                );
-            }
-        } else {
-            log::debug!("preserved token {token_str:?} not found in vocabulary");
-        }
-    }
-    if !set.is_empty() {
-        log::debug!("preserved tokens: {:?}", tr.preserved_tokens);
-    }
-    set
-}
-
-/// Collect additional stop sequences from the template result.
-fn get_additional_stops(
-    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
-) -> Vec<String> {
-    template_result
-        .map(|tr| tr.additional_stops.clone())
-        .unwrap_or_default()
-}
 
 /// Convert a `token_to_piece` outcome into a piece-or-empty result.
 ///
 /// `llama.cpp`'s `llama_token_to_piece` returns size 0 when the token has
 /// no printable representation — typically a control / unused / unknown-
-/// attribute token (e.g. `<|im_start|>`, `<|fim_pad|>`) that wasn't in
-/// the preserved set so `decode_special` was `false`. The `llama-cpp-2`
+/// attribute token (e.g. `<|im_start|>`, `<|fim_pad|>`). The `llama-cpp-2`
 /// wrapper surfaces that as `TokenToStringError::UnknownTokenType`.
 ///
-/// Canonical `llama.cpp` (see `examples/main/main.cpp`) treats empty
-/// pieces as "no text to emit, keep generating" — the sampled token is
-/// still consistent with the KV cache because the caller appends it to
-/// the batch on the next iteration. Aborting the whole generation on
-/// the first such token (as the previous code did) means models with
-/// rare control tokens in their vocabulary — Qwen3's `<|object_ref_*|>`
-/// pair, structured-output sampling that lands on `<|fim_pad|>`, etc. —
-/// can fail mid-stream with `Token to piece failed: Unknown Token Type`.
-///
+/// Canonical `llama.cpp` treats empty pieces as "no text to emit, keep
+/// generating" — the sampled token is still consistent with the KV cache
+/// because the caller appends it to the batch on the next iteration.
 /// Real errors (`InsufficientBufferSpace`, `FromUtf8Error`, …) still
 /// propagate so genuine bugs aren't silently swallowed.
 pub(crate) fn token_piece_or_empty(
@@ -81,77 +31,38 @@ pub(crate) fn token_piece_or_empty(
     }
 }
 
-/// Sample one token, working around llama-cpp-rs#1007 when grammar is present.
+/// Sample one token.
 ///
-/// `LlamaSampler::sample(ctx, idx)` aborts via `GGML_ASSERT(!stacks.empty())`
-/// in `llama-grammar.cpp:940` on the first sample call when the chain
-/// contains `LlamaSampler::grammar(...)` — see
-/// <https://github.com/utilityai/llama-cpp-rs/issues/1007>. The reporter
-/// confirmed that applying the same chain to a manually-built
-/// `LlamaTokenDataArray` (built from `ctx.get_logits_ith(idx)`) does not
-/// crash, so when grammar is active we sample via that path instead.
-///
-/// `apply_sampler` does not internally call `accept()`, so the grammar
-/// branch must do so explicitly. The non-grammar branch keeps the
-/// existing legacy double-accept (`sample()` already accepts internally,
-/// then we accept again — the base samplers were calibrated against
-/// that behavior).
-///
-/// Remove this helper once upstream llama.cpp fixes the assert and
-/// llama-cpp-2 ships a release that resyncs to it.
+/// `LlamaSampler::sample()` applies the chain and accepts the result
+/// internally. When the chain contains the llguidance JSON-schema sampler we
+/// must NOT accept again (double-consuming would desync the matcher); when
+/// only the base samplers are present we preserve the legacy double-accept
+/// that the penalty samplers were calibrated against.
 fn sample_one(
     ctx: &llama_cpp_2::context::LlamaContext,
     sampler: &mut llama_cpp_2::sampling::LlamaSampler,
     idx: i32,
-    has_grammar: bool,
+    has_schema_sampler: bool,
 ) -> llama_cpp_2::token::LlamaToken {
-    use llama_cpp_2::token::{LlamaToken, data::LlamaTokenData, data_array::LlamaTokenDataArray};
-
-    if has_grammar {
-        let logits = ctx.get_logits_ith(idx);
-        let mut arr = LlamaTokenDataArray::from_iter(
-            logits
-                .iter()
-                .enumerate()
-                .map(|(id, &logit)| LlamaTokenData::new(LlamaToken(id as i32), logit, 0.0)),
-            false,
-        );
-        arr.apply_sampler(sampler);
-        let token = arr
-            .selected_token()
-            .expect("sampler chain failed to select a token");
+    let token = sampler.sample(ctx, idx);
+    if !has_schema_sampler {
         sampler.accept(token);
-        token
-    } else {
-        let token = sampler.sample(ctx, idx);
-        sampler.accept(token);
-        token
     }
+    token
 }
 
-/// Escape regex metacharacters in a string (for Word-type grammar triggers).
-fn regex_escape(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if r"\.^$*+?()[]{}|".contains(c) {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
-}
-
-/// Build a sampler chain with optional grammar constraints from the chat template.
+/// Build a sampler chain, prepending an llguidance JSON-schema constraint when
+/// the request carries an `output_schema`.
 ///
-/// When `ChatTemplateResult` provides a grammar (e.g. for tool-call output), the grammar
-/// sampler is prepended to the chain so invalid tokens are zeroed before other samplers rank
-/// the remaining candidates.
+/// `llama-cpp-2` 0.1.147 removed the chat-template-derived grammar that used
+/// to constrain tool-call output (`ChatTemplateResult.grammar`). Tool calls
+/// are now parsed from the model's free-form output (see `src/parsing.rs`),
+/// and structured-output (`json_schema`) constraints are applied via the
+/// llguidance sampler, which accepts a JSON schema directly.
 fn build_sampler_chain(
     model: &llama_cpp_2::model::LlamaModel,
-    template_result: Option<&llama_cpp_2::model::ChatTemplateResult>,
     req: &InferenceParams,
-) -> SamplerChain {
-    use llama_cpp_2::model::GrammarTriggerType;
+) -> (llama_cpp_2::sampling::LlamaSampler, bool) {
     use llama_cpp_2::sampling::LlamaSampler;
 
     let base_samplers = vec![
@@ -163,85 +74,30 @@ fn build_sampler_chain(
         LlamaSampler::dist(42),
     ];
 
-    // Attempt to create a grammar sampler from the template result.
-    let grammar_sampler = template_result
-        .and_then(|tr| tr.grammar.as_ref().map(|g| (g, tr)))
-        .and_then(|(grammar_str, tr)| {
-            let result = if tr.grammar_lazy {
-                // Convert triggers into patterns and tokens for lazy grammar.
-                let mut trigger_patterns = Vec::new();
-                let mut trigger_tokens = Vec::new();
-
-                for trigger in &tr.grammar_triggers {
-                    match trigger.trigger_type {
-                        GrammarTriggerType::Token => {
-                            if let Some(tok) = trigger.token {
-                                trigger_tokens.push(tok);
-                            }
-                        }
-                        GrammarTriggerType::Word => {
-                            trigger_patterns.push(regex_escape(&trigger.value));
-                        }
-                        GrammarTriggerType::Pattern => {
-                            trigger_patterns.push(trigger.value.clone());
-                        }
-                        GrammarTriggerType::PatternFull => {
-                            let mut pat = trigger.value.clone();
-                            if !pat.starts_with('^') {
-                                pat.insert(0, '^');
-                            }
-                            if !pat.ends_with('$') {
-                                pat.push('$');
-                            }
-                            trigger_patterns.push(pat);
-                        }
-                    }
-                }
-
-                if trigger_patterns.is_empty() && trigger_tokens.is_empty() {
-                    // No triggers means lazy grammar would never activate; fall back to eager.
-                    log::debug!(
-                        "grammar_lazy is true but no triggers found, \
-                         falling back to eager grammar"
-                    );
-                    LlamaSampler::grammar(model, grammar_str, "root")
-                } else {
-                    LlamaSampler::grammar_lazy_patterns(
-                        model,
-                        grammar_str,
-                        "root",
-                        &trigger_patterns,
-                        &trigger_tokens,
-                    )
-                }
-            } else {
-                LlamaSampler::grammar(model, grammar_str, "root")
-            };
-
-            match result {
-                Ok(sampler) => {
-                    log::debug!("grammar sampler created (lazy={})", tr.grammar_lazy);
-                    Some(sampler)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "grammar sampler creation failed, falling back to unconstrained sampling: {e}"
-                    );
-                    None
-                }
+    // JSON-schema constrained generation via llguidance. The schema string is
+    // the serialized JSON Schema; llguidance's "json" tag parses it directly.
+    let schema_sampler = req.prepared_request.json_schema.as_deref().and_then(|schema| {
+        match LlamaSampler::llguidance(model, "json", schema) {
+            Ok(s) => {
+                log::debug!("llguidance json-schema sampler created");
+                Some(s)
             }
-        });
+            Err(e) => {
+                log::warn!(
+                    "llguidance sampler creation failed, falling back to unconstrained sampling: {e}"
+                );
+                None
+            }
+        }
+    });
 
-    let has_grammar = grammar_sampler.is_some();
-    let mut samplers = Vec::with_capacity(7);
-    if let Some(gs) = grammar_sampler {
-        samplers.push(gs);
+    let has_schema = schema_sampler.is_some();
+    let mut samplers = Vec::with_capacity(base_samplers.len() + 1);
+    if let Some(s) = schema_sampler {
+        samplers.push(s);
     }
     samplers.extend(base_samplers);
-    SamplerChain {
-        sampler: llama_cpp_2::sampling::LlamaSampler::chain_simple(samplers),
-        has_grammar,
-    }
+    (LlamaSampler::chain_simple(samplers), has_schema)
 }
 
 #[cfg(feature = "mtmd")]
@@ -250,7 +106,7 @@ pub(crate) fn sample_tokens_from_pos(
     model: &llama_cpp_2::model::LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
-    prompt_build: &PromptBuildResult,
+    _prompt_build: &PromptBuildResult,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
@@ -259,138 +115,16 @@ pub(crate) fn sample_tokens_from_pos(
     last_entries: &mut Vec<SlotEntry>,
     cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
-    let SamplerChain {
-        mut sampler,
-        has_grammar,
-    } = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
-
-    let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
-    let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
-
-    let mut output = String::new();
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut completion_tokens = 0u64;
-
-    // See `sample_tokens` for the rationale: bypass the OAI streaming
-    // parser when a `json_schema` is set; it buffers grammar-constrained
-    // JSON output and crashes on flush, dropping every chunk.
-    let bypass_oai_parser = req.prepared_request.json_schema.is_some();
-    let mut stream_parser = if stream_tx.is_some() && !bypass_oai_parser {
-        prompt_build
-            .template_result
-            .as_ref()
-            .and_then(|tr| tr.streaming_state_oaicompat().ok())
-    } else {
-        None
-    };
-    let mut delta_state = StreamDeltaState::new();
-
-    for n_cur in (n_past..).take(req.max_tokens as usize) {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(CANCEL_ERR.to_string());
-        }
-        if let Some(tx) = stream_tx
-            && tx.is_closed()
-        {
-            break;
-        }
-
-        // For the first token after eval_chunks, sample from index -1 (last logits)
-        let sample_idx = if completion_tokens == 0 {
-            -1
-        } else {
-            batch.n_tokens() - 1
-        };
-        let token = sample_one(ctx, &mut sampler, sample_idx, has_grammar);
-
-        if model.is_eog_token(token) {
-            break;
-        }
-
-        let decode_special = preserved_tokens.contains(&token);
-        let piece =
-            token_piece_or_empty(model.token_to_piece(token, &mut decoder, decode_special, None))?;
-        output.push_str(&piece);
-        completion_tokens += 1;
-
-        // Check for additional stop sequences
-        if let Some(stop) = additional_stops
-            .iter()
-            .find(|s| output.ends_with(s.as_str()))
-        {
-            let stop_len = stop.len();
-            output.truncate(output.len() - stop_len);
-            break;
-        }
-
-        if let Some(tx) = stream_tx
-            && !bypass_oai_parser
-        {
-            if let Some(parser) = stream_parser.as_mut() {
-                match parser.update(&piece, true) {
-                    Ok(deltas) => {
-                        for delta_json in deltas {
-                            for choice in delta_state.parse_delta(&delta_json) {
-                                let _ = tx.send(Ok(choice));
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let _ = tx.send(Ok(RawStreamingChoice::Message(piece.clone())));
-                    }
-                }
-            } else {
-                let _ = tx.send(Ok(RawStreamingChoice::Message(piece.clone())));
-            }
-        }
-
-        batch.clear();
-        batch
-            .add(token, n_cur, &[0], true)
-            .map_err(|e| format!("Batch add failed: {e}"))?;
-        ctx.decode(batch)
-            .map_err(|e| format!("Decode failed: {e}"))?;
-        last_entries.push(SlotEntry::Text(token));
-    }
-
-    log::debug!("raw output:\n{output}");
-
-    // Flush remaining deltas from the streaming parser
-    if let Some(tx) = stream_tx {
-        if !bypass_oai_parser {
-            if let Some(parser) = stream_parser.as_mut()
-                && let Ok(deltas) = parser.update("", false)
-            {
-                for delta_json in deltas {
-                    for choice in delta_state.parse_delta(&delta_json) {
-                        let _ = tx.send(Ok(choice));
-                    }
-                }
-            }
-            for choice in
-                delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref())
-            {
-                let _ = tx.send(Ok(choice));
-            }
-        } else if let Some(json) = extract_structured_json(&output) {
-            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
-        }
-    }
-
-    let choice = if stream_tx.is_some() {
-        if bypass_oai_parser && let Some(json) = extract_structured_json(&output) {
-            OneOrMany::one(AssistantContent::text(json))
-        } else {
-            OneOrMany::one(AssistantContent::text(output.clone()))
-        }
-    } else {
-        parse_completion_output(
-            &output,
-            prompt_build.template_result.as_ref(),
-            req.prepared_request.json_schema.is_some(),
-        )?
-    };
-
+    let (output, choice, completion_tokens) = sample_loop(
+        model,
+        ctx,
+        batch,
+        req,
+        stream_tx,
+        n_past,
+        last_entries,
+        cancel,
+    )?;
     Ok(InferenceResult {
         text: output,
         choice,
@@ -405,7 +139,7 @@ pub(crate) fn sample_tokens(
     model: &llama_cpp_2::model::LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
-    prompt_build: &PromptBuildResult,
+    _prompt_build: &PromptBuildResult,
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
     prompt_tokens: u64,
@@ -413,90 +147,89 @@ pub(crate) fn sample_tokens(
     last_entries: &mut Vec<SlotEntry>,
     cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
-    let SamplerChain {
-        mut sampler,
-        has_grammar,
-    } = build_sampler_chain(model, prompt_build.template_result.as_ref(), req);
+    // Text path: generation resumes right after the prompt tokens.
+    let n_past = prompt_tokens as i32;
+    let (output, choice, completion_tokens) = sample_loop(
+        model,
+        ctx,
+        batch,
+        req,
+        stream_tx,
+        n_past,
+        last_entries,
+        cancel,
+    )?;
+    Ok(InferenceResult {
+        text: output,
+        choice,
+        prompt_tokens,
+        completion_tokens,
+        cached_input_tokens,
+    })
+}
 
-    let preserved_tokens = build_preserved_token_set(model, prompt_build.template_result.as_ref());
-    let additional_stops = get_additional_stops(prompt_build.template_result.as_ref());
+/// Core sampling loop shared by the text and mtmd paths. The mtmd path enters
+/// at `n_past` (the position after image chunks); the text path enters at
+/// `prompt_tokens`.
+///
+/// Returns `(output_text, AssistantContent choice, completion_token_count)`.
+#[allow(clippy::too_many_arguments)]
+fn sample_loop(
+    model: &llama_cpp_2::model::LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
+    req: &InferenceParams,
+    stream_tx: Option<&StreamSender>,
+    n_past: i32,
+    last_entries: &mut Vec<SlotEntry>,
+    cancel: &AtomicBool,
+) -> Result<(String, OneOrMany<AssistantContent>, u64), String> {
+    let (mut sampler, has_schema) = build_sampler_chain(model, req);
+
+    let has_tools = req.prepared_request.tools_json.is_some();
+    let has_schema_request = req.prepared_request.json_schema.is_some();
+    // Tool-calling turns buffer the whole generation: the model may emit
+    // `<tool_call>` XML that we must parse whole before emitting anything, so
+    // consumers don't see the raw tool-call text as message deltas.
+    let buffer_output = has_tools;
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut completion_tokens = 0u64;
 
-    // The OAI streaming parser silently buffers content while
-    // `is_partial=true` and crashes on flush (`FfiError(-3)`) when the
-    // payload is grammar-constrained JSON — we lose every chunk. Until
-    // upstream `llama.cpp`'s `llama_rs_chat_parse_state_*` is fixed,
-    // bypass the parser entirely when a `json_schema` is set: stream
-    // the raw pieces and let `extract_structured_json` clean up role
-    // markers (`<|im_start|>assistant\n\n…`) and trailing junk at the
-    // end as a single corrective chunk.
-    let bypass_oai_parser = req.prepared_request.json_schema.is_some();
-    let mut stream_parser = if stream_tx.is_some() && !bypass_oai_parser {
-        prompt_build
-            .template_result
-            .as_ref()
-            .and_then(|tr| tr.streaming_state_oaicompat().ok())
-    } else {
-        None
-    };
-    let mut delta_state = StreamDeltaState::new();
-
-    for n_cur in (prompt_tokens as i32..).take(req.max_tokens as usize) {
-        // Hard cancel from `Client::drop` (or future per-request hook).
+    for n_cur in (n_past..).take(req.max_tokens as usize) {
         if cancel.load(Ordering::Relaxed) {
             return Err(CANCEL_ERR.to_string());
         }
-        // Stop early if the consumer disconnected (e.g. user cancelled).
         if let Some(tx) = stream_tx
             && tx.is_closed()
         {
             break;
         }
 
-        let token = sample_one(ctx, &mut sampler, batch.n_tokens() - 1, has_grammar);
+        // First token samples from -1 (last logits); subsequent ones from the
+        // last batch position.
+        let sample_idx = if completion_tokens == 0 {
+            -1
+        } else {
+            batch.n_tokens() - 1
+        };
+        let token = sample_one(ctx, &mut sampler, sample_idx, has_schema);
 
         if model.is_eog_token(token) {
             break;
         }
 
-        let decode_special = preserved_tokens.contains(&token);
-        let piece =
-            token_piece_or_empty(model.token_to_piece(token, &mut decoder, decode_special, None))?;
+        let piece = token_piece_or_empty(model.token_to_piece(token, &mut decoder, false, None))?;
         output.push_str(&piece);
         completion_tokens += 1;
 
-        // Check for additional stop sequences
-        if let Some(stop) = additional_stops
-            .iter()
-            .find(|s| output.ends_with(s.as_str()))
-        {
-            let stop_len = stop.len();
-            output.truncate(output.len() - stop_len);
-            break;
-        }
-
+        // Stream incremental text only when not buffering a tool-call turn.
+        // For structured output the pieces are JSON tokens and stream fine.
         if let Some(tx) = stream_tx
-            && !bypass_oai_parser
+            && !buffer_output
         {
-            if let Some(parser) = stream_parser.as_mut() {
-                match parser.update(&piece, true) {
-                    Ok(deltas) => {
-                        for delta_json in deltas {
-                            for choice in delta_state.parse_delta(&delta_json) {
-                                let _ = tx.send(Ok(choice));
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let _ = tx.send(Ok(RawStreamingChoice::Message(piece)));
-                    }
-                }
-            } else {
-                let _ = tx.send(Ok(RawStreamingChoice::Message(piece)));
-            }
+            let _ = tx.send(Ok(RawStreamingChoice::Message(piece)));
         }
 
         batch.clear();
@@ -505,68 +238,88 @@ pub(crate) fn sample_tokens(
             .map_err(|e| format!("Batch add failed: {e}"))?;
         ctx.decode(batch)
             .map_err(|e| format!("Decode failed: {e}"))?;
-        // Track tokens that are now committed to the KV cache so the next
-        // request can detect the longest common prefix correctly.
         last_entries.push(SlotEntry::Text(token));
     }
 
     log::debug!("raw output:\n{output}");
 
-    // Flush remaining deltas from the streaming parser
     if let Some(tx) = stream_tx {
-        if !bypass_oai_parser {
-            if let Some(parser) = stream_parser.as_mut()
-                && let Ok(deltas) = parser.update("", false)
-            {
-                for delta_json in deltas {
-                    for choice in delta_state.parse_delta(&delta_json) {
-                        let _ = tx.send(Ok(choice));
-                    }
-                }
-            }
-            // Emit complete tool calls so they get accumulated into assistant_items
-            for choice in
-                delta_state.flush_tool_calls(&output, prompt_build.template_result.as_ref())
-            {
-                let _ = tx.send(Ok(choice));
-            }
-        } else if let Some(json) = extract_structured_json(&output) {
-            // Single corrective chunk for the structured-output path:
-            // chat templates with `add_generation_prompt: true` plus a
-            // grammar that fires lazily can leak the assistant role
-            // header (`<|im_start|>assistant\n\n`) into the model's
-            // own output. Strip it (and any trailing junk) so the
-            // accumulated stream is parseable JSON.
-            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
-        }
+        flush_stream(tx, &output, has_tools, has_schema_request);
     }
 
-    let choice = if stream_tx.is_some() {
-        // For streaming, choice was already sent through the stream;
-        // return a minimal placeholder for InferenceResult. When the
-        // payload is structured, prefer the cleaned JSON so non-stream
-        // consumers of `InferenceResult.text` see the same canonical
-        // form the stream emitted.
-        if bypass_oai_parser && let Some(json) = extract_structured_json(&output) {
-            OneOrMany::one(AssistantContent::text(json))
-        } else {
-            OneOrMany::one(AssistantContent::text(output.clone()))
-        }
-    } else {
-        parse_completion_output(
-            &output,
-            prompt_build.template_result.as_ref(),
-            req.prepared_request.json_schema.is_some(),
-        )?
-    };
+    let choice = build_choice(&output, stream_tx.is_some(), has_tools, has_schema_request)?;
 
-    Ok(InferenceResult {
-        text: output,
-        choice,
-        prompt_tokens,
-        completion_tokens,
-        cached_input_tokens,
-    })
+    Ok((output, choice, completion_tokens))
+}
+
+/// Emit the tail of a stream after generation completes.
+///
+/// - **json_schema**: emit a single corrective chunk containing the cleaned
+///   JSON (strips role tokens / markdown fences the template may leak).
+/// - **tools**: parse the buffered output for tool calls and emit complete
+///   `ToolCall` events. Any leading prose before the first `<tool_call>` is
+///   also surfaced as a message chunk.
+/// - **plain text**: nothing to flush (text was streamed incrementally).
+fn flush_stream(tx: &StreamSender, output: &str, has_tools: bool, has_schema: bool) {
+    if has_schema {
+        if let Some(json) = extract_structured_json(output) {
+            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
+        }
+        return;
+    }
+
+    if has_tools {
+        if let Some(tool_calls) = parse_tool_calls(output) {
+            // Surface any prose preceding the first tool call as text.
+            if let Some(prefix_end) = output.find("<tool_call>")
+                && !output[..prefix_end].trim().is_empty()
+            {
+                let _ = tx.send(Ok(RawStreamingChoice::Message(
+                    output[..prefix_end].trim().to_string(),
+                )));
+            }
+            for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
+                let id = format!("tool-call-{i}");
+                let _ = tx.send(Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                    id.clone(),
+                    name,
+                    arguments,
+                ))));
+            }
+        } else {
+            // No tool calls parsed; emit the buffered text as one message.
+            let _ = tx.send(Ok(RawStreamingChoice::Message(output.to_string())));
+        }
+    }
+}
+
+/// Build the final `OneOrMany<AssistantContent>` choice from the raw output.
+fn build_choice(
+    output: &str,
+    is_stream: bool,
+    has_tools: bool,
+    has_schema: bool,
+) -> Result<OneOrMany<AssistantContent>, String> {
+    if is_stream {
+        if has_schema && let Some(json) = extract_structured_json(output) {
+            return Ok(OneOrMany::one(AssistantContent::text(json)));
+        }
+        if has_tools && let Some(tool_calls) = parse_tool_calls(output) {
+            let mut content: Vec<AssistantContent> = Vec::new();
+            for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
+                content.push(AssistantContent::ToolCall(ToolCall::new(
+                    format!("tool-call-{i}"),
+                    ToolFunction::new(name, arguments),
+                )));
+            }
+            if let Ok(result) = OneOrMany::many(content) {
+                return Ok(result);
+            }
+        }
+        return Ok(OneOrMany::one(AssistantContent::text(output.to_string())));
+    }
+
+    parse_completion_output(output, has_schema)
 }
 
 #[cfg(test)]
@@ -581,20 +334,12 @@ mod tests {
 
     #[test]
     fn token_piece_or_empty_swallows_unknown_token_type() {
-        // Control / unused / unknown-attribute tokens come back from
-        // llama.cpp as size 0, surfaced as UnknownTokenType. We map
-        // those to empty pieces so generation can continue rather than
-        // aborting on the first such token (regression for Qwen3-style
-        // vocabularies and grammar-constrained sampling that lands on
-        // a control token).
         let result = token_piece_or_empty(Err(llama_cpp_2::TokenToStringError::UnknownTokenType));
         assert_eq!(result.as_deref(), Ok(""));
     }
 
     #[test]
     fn token_piece_or_empty_propagates_real_errors() {
-        // InsufficientBufferSpace is a real failure (buffer too small);
-        // unlike UnknownTokenType it indicates a bug we want surfaced.
         let result = token_piece_or_empty(Err(
             llama_cpp_2::TokenToStringError::InsufficientBufferSpace(-32),
         ));

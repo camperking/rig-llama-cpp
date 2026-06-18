@@ -3,7 +3,7 @@
 //! A [Rig](https://docs.rs/rig-core) provider that runs GGUF models locally
 //! via [llama.cpp](https://github.com/ggml-org/llama.cpp), with optional Vulkan GPU acceleration.
 //!
-//! This crate implements Rig's [`rig::completion::CompletionModel`] and [`rig::embeddings::EmbeddingModel`] traits
+//! This crate implements Rig's [`rig_core::completion::CompletionModel`] and [`rig_core::embeddings::EmbeddingModel`] traits
 //! so that any GGUF model can be used as a drop-in replacement for cloud-based providers. It supports:
 //!
 //! - **Completion and streaming** — both one-shot and token-by-token responses.
@@ -43,8 +43,8 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use rig::client::CompletionClient;
-//! use rig::completion::Prompt;
+//! use rig_core::client::CompletionClient;
+//! use rig_core::completion::Prompt;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {

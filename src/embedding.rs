@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::thread;
 
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
+use rig_core::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::LoadError;
@@ -19,11 +19,11 @@ struct EmbeddingRequest {
 /// The llama.cpp embedding client.
 ///
 /// `EmbeddingClient` loads a GGUF embedding model on a dedicated worker thread
-/// and exposes it through Rig's [`rig::embeddings::EmbeddingModel`] trait.
+/// and exposes it through Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
 /// Create one with [`EmbeddingClient::from_gguf`].
 ///
 /// ```rust,no_run
-/// use rig::embeddings::EmbeddingModel;
+/// use rig_core::embeddings::EmbeddingModel;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,7 +106,7 @@ impl Drop for EmbeddingClient {
     }
 }
 
-/// A handle to a loaded embedding model that implements Rig's [`rig::embeddings::EmbeddingModel`] trait.
+/// A handle to a loaded embedding model that implements Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
 ///
 /// Obtained via [`EmbeddingClient::embedding_model`].
 #[derive(Clone)]
@@ -117,7 +117,7 @@ pub struct EmbeddingModelHandle {
     model_id: String,
 }
 
-impl rig::embeddings::EmbeddingModel for EmbeddingModelHandle {
+impl rig_core::embeddings::EmbeddingModel for EmbeddingModelHandle {
     const MAX_DOCUMENTS: usize = 256;
     type Client = EmbeddingClient;
 
@@ -253,7 +253,7 @@ fn run_embedding(
         .with_n_ctx(NonZeroU32::new(n_ctx).map(Some).unwrap_or(None))
         .with_n_batch(n_ctx)
         .with_n_ubatch(n_ctx)
-        .with_n_seq_max((texts.len() as u32).max(1))
+        .with_n_seq_max(1)
         .with_embeddings(true);
 
     let mut ctx = model
@@ -262,48 +262,34 @@ fn run_embedding(
 
     let batch_limit = ctx.n_batch().max(1) as usize;
 
-    // Tokenize all texts
-    let tokenized: Vec<Vec<_>> = texts
-        .iter()
-        .map(|text| model.str_to_token(text, AddBos::Always))
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("Tokenization failed: {e}"))?;
-
+    // Encode each text in its own single-sequence batch. Packing multiple
+    // sequences into one batch trips a `ggml_can_mul_mat` assert on
+    // mixture-of-experts architectures (e.g. nomic-embed-text-v2-moe) where
+    // expert routing produces incompatible tensor shapes across concurrent
+    // sequences. One-at-a-time encoding is correct for every architecture at
+    // the cost of some throughput.
     let mut results = Vec::with_capacity(texts.len());
-    let mut text_idx = 0;
+    for text in texts {
+        let tokens = model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| format!("Tokenization failed: {e}"))?;
 
-    while text_idx < texts.len() {
-        let mut batch = LlamaBatch::new(batch_limit, texts.len().min(batch_limit) as i32);
-        let mut total_tokens = 0;
-        let mut batch_seq_ids = Vec::new();
-        let batch_start = text_idx;
-
-        // Pack as many texts as fit in one batch
-        while text_idx < texts.len() {
-            let tokens = &tokenized[text_idx];
-            if total_tokens + tokens.len() > batch_limit && !batch_seq_ids.is_empty() {
-                break;
-            }
-            let seq_id = (text_idx - batch_start) as i32;
-            for (pos, &token) in tokens.iter().enumerate() {
+        // Tokenise in chunks that fit `batch_limit` (very long inputs).
+        for chunk in tokens.chunks(batch_limit) {
+            let mut batch = LlamaBatch::new(batch_limit, 1);
+            for (pos, &token) in chunk.iter().enumerate() {
                 batch
-                    .add(token, pos as i32, &[seq_id], true)
+                    .add(token, pos as i32, &[0], true)
                     .map_err(|e| format!("Batch add failed: {e}"))?;
             }
-            batch_seq_ids.push(seq_id);
-            total_tokens += tokens.len();
-            text_idx += 1;
+            ctx.encode(&mut batch)
+                .map_err(|e| format!("Embedding encode failed: {e}"))?;
         }
 
-        ctx.encode(&mut batch)
-            .map_err(|e| format!("Embedding encode failed: {e}"))?;
-
-        for &seq_id in &batch_seq_ids {
-            let emb = ctx
-                .embeddings_seq_ith(seq_id)
-                .map_err(|e| format!("Failed to get embedding for seq {seq_id}: {e}"))?;
-            results.push(emb.to_vec());
-        }
+        let emb = ctx
+            .embeddings_seq_ith(0)
+            .map_err(|e| format!("Failed to get embedding: {e}"))?;
+        results.push(emb.to_vec());
 
         ctx.clear_kv_cache();
     }

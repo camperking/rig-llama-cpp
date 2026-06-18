@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rig::completion::CompletionError;
-use rig::streaming::RawStreamingChoice;
+use rig_core::completion::CompletionError;
+use rig_core::streaming::RawStreamingChoice;
 use tokio::sync::mpsc;
 
 use crate::checkpoint::{

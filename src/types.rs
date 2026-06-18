@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-
-use rig::completion::{CompletionError, GetTokenUsage, Usage};
-use rig::message::AssistantContent;
-use rig::one_or_many::OneOrMany;
-use rig::streaming::{RawStreamingChoice, RawStreamingToolCall};
+use rig_core::completion::{CompletionError, GetTokenUsage, Usage};
+use rig_core::message::AssistantContent;
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::RawStreamingChoice;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -49,6 +47,8 @@ impl GetTokenUsage for StreamChunk {
             total_tokens: input + output,
             cached_input_tokens: self.cached_input_tokens.unwrap_or(0),
             cache_creation_input_tokens: 0,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -108,6 +108,13 @@ pub(crate) struct PreparedRequest {
     pub tools_json: Option<String>,
     pub tool_choice: Option<String>,
     pub json_schema: Option<String>,
+    /// Parsed from the request's `additional_params` (`{ "thinking": bool }`).
+    /// `llama-cpp-2` 0.1.147 dropped the `chat_template_kwargs` plumbing the
+    /// old oaicompat path used to forward this to the jinja engine, so the
+    /// flag is currently advisory: thinking-enabled is the template default
+    /// and continues to work; thinking-disabled can no longer be enforced
+    /// through the template and is surfaced only via the model's defaults.
+    #[allow(dead_code)]
     pub enable_thinking: bool,
     #[cfg(feature = "mtmd")]
     pub images: Vec<PreparedImage>,
@@ -125,7 +132,6 @@ pub(crate) struct PreparedImage {
 
 pub(crate) struct PromptBuildResult {
     pub prompt: String,
-    pub template_result: Option<llama_cpp_2::model::ChatTemplateResult>,
 }
 
 /// Sampling parameters that control token generation.
@@ -498,19 +504,4 @@ impl KvCacheParams {
         self.type_v = type_v;
         self
     }
-}
-
-/// Result of building a sampler chain: the chain itself plus whether grammar is active.
-///
-/// When grammar is present, `llama_sampler_sample()` already calls `accept()` internally
-/// and we must NOT call it again (double-accept corrupts grammar state). When grammar is
-/// absent, we call `accept()` explicitly after `sample()` to preserve the legacy
-/// double-accept behavior that the base samplers were tuned around.
-pub(crate) struct SamplerChain {
-    pub sampler: llama_cpp_2::sampling::LlamaSampler,
-    pub has_grammar: bool,
-}
-
-pub(crate) struct StreamDeltaState {
-    pub tool_calls: HashMap<u64, RawStreamingToolCall>,
 }

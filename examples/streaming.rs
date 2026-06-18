@@ -1,6 +1,6 @@
-use rig::client::CompletionClient;
-use rig::streaming::StreamingPrompt;
-use rig::tool::ToolDyn;
+use rig_core::client::CompletionClient;
+use rig_core::streaming::StreamingPrompt;
+use rig_core::tool::ToolDyn;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde_json::json;
 

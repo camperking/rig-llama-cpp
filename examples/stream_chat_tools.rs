@@ -1,9 +1,9 @@
-use rig::agent::MultiTurnStreamItem;
-use rig::client::CompletionClient;
-use rig::completion::ToolDefinition;
-use rig::message::Message;
-use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
-use rig::tool::{Tool, ToolDyn};
+use rig_core::agent::MultiTurnStreamItem;
+use rig_core::client::CompletionClient;
+use rig_core::completion::ToolDefinition;
+use rig_core::message::Message;
+use rig_core::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
+use rig_core::tool::{Tool, ToolDyn};
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

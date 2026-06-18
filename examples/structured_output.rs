@@ -1,5 +1,5 @@
-use rig::client::CompletionClient;
-use rig::completion::TypedPrompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::TypedPrompt;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use schemars::JsonSchema;
 use serde::Deserialize;

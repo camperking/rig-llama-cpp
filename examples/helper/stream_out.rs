@@ -1,5 +1,5 @@
-use rig::agent::{FinalResponse, MultiTurnStreamItem, StreamingResult, Text};
-use rig::streaming::StreamedAssistantContent;
+use rig_core::agent::{FinalResponse, MultiTurnStreamItem, StreamingResult, Text};
+use rig_core::streaming::StreamedAssistantContent;
 use tokio_stream::StreamExt;
 
 /// Helper function to stream a completion request to stdout.
@@ -11,7 +11,7 @@ pub async fn stream_out<R>(
     while let Some(content) = stream.next().await {
         match content {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
-                Text { text },
+                Text { text, .. },
             ))) => {
                 print!("{text}");
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();

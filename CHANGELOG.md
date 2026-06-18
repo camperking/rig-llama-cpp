@@ -20,6 +20,56 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.2.0] — 2026-06-18
+
+### Changed
+
+- **Bumped `rig-core` to `0.38.2`.** The upstream library renamed its crate
+  root from `rig` to `rig_core` (now `use rig_core::…`); the two new
+  `Usage` fields (`tool_use_prompt_tokens`, `reasoning_tokens`) are populated
+  as `0` since llama.cpp does not report them separately.
+- **Bumped `llama-cpp-2` to `0.1.150` / `llama-cpp-sys-2` to `0.1.150`,
+  migrating off the removed `openai` module.** `llama-cpp-2` 0.1.147 deleted
+  the entire `openai` module
+  (`apply_chat_template_oaicompat`, `OpenAIChatTemplateParams`,
+  `ChatTemplateResult`, `parse_response_oaicompat`,
+  `streaming_state_oaicompat`) plus `GrammarTriggerType`. This release
+  replaces every consumer of that API:
+
+  - **Prompt rendering** now uses `apply_chat_template` (role + content
+    messages). Tool schemas are injected into the system prompt (the
+    portable pattern now that the jinja engine no longer receives a
+    `tools` parameter), and `<tool_call>` XML is requested as the emission
+    format.
+  - **Structured output** (`json_schema`) is enforced by the new
+    `llguidance` sampler (`LlamaSampler::llguidance(model, "json", schema)`),
+    which is cleaner than the old oaicompat path. The `common` and
+    `llguidance` features of `llama-cpp-2` are now always enabled.
+  - **Tool-call parsing** is unified in `parse_tool_calls`, which recognises
+    `<tool_call>` blocks (both Qwen XML parameter form and JSON form) and
+    bare / markdown-fenced `{"name":…,"arguments":…}` JSON.
+  - **Streaming** emits raw text pieces incrementally for plain and
+    structured turns, and buffers tool-calling turns so the complete output
+    is parsed for tool calls at flush (the incremental OAI streaming parser
+    is gone with the `openai` module).
+
+### Fixed
+
+- **Multi-text embedding on mixture-of-experts models.** Packing multiple
+  sequences into one `encode` batch tripped a `GGML_ASSERT(ggml_can_mul_mat)`
+  on MoE architectures such as `nomic-embed-text-v2-moe`. Embeddings are now
+  encoded one text at a time, which is correct for every architecture.
+
+### Removed
+
+- **Template-derived grammar / `chat_template_kwargs`.** The
+  `apply_chat_template_oaicompat` plumbing that forwarded `enable_thinking`,
+  `grammar`, `grammar_lazy`/`grammar_triggers`, `preserved_tokens`, and
+  `additional_stops` to the jinja engine no longer exists upstream. The
+  `enable_thinking` flag is parsed from `additional_params` but is advisory
+  only: thinking-enabled remains the template default; thinking-disabled can
+  no longer be enforced through the template.
+
 ## [0.1.4] — 2026-05-06
 
 ### Fixed

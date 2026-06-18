@@ -17,8 +17,8 @@ Drop it in wherever you'd use a cloud provider — same `CompletionModel` trait,
 ## Usage
 
 ```rust
-use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::completion::Prompt;
 use rig_llama_cpp::Client;
 
 #[tokio::main]
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The legacy positional `Client::from_gguf(...)` constructor is still
-available for callers pinned to the 0.1.x API.
+available for callers pinned to the pre-0.2 API.
 
 ## Features
 
