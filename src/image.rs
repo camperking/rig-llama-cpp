@@ -49,7 +49,7 @@ pub(crate) fn run_image_inference<'m>(
         .images
         .iter()
         .map(|img| -> Result<_, String> {
-            let bm = llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, &img.bytes)
+            let bm = llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, &img.bytes, false)
                 .map_err(|e| format!("Failed to create bitmap from image data: {e}"))?;
             bm.set_id(&format!("{:016x}", img.hash))
                 .map_err(|e| format!("Failed to set bitmap id: {e}"))?;

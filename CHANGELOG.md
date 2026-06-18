@@ -20,6 +20,18 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.2.1] — 2026-06-18
+
+### Fixed
+
+- **Image inference builds against `llama-cpp-2` 0.1.150.** Upstream
+  `MtmdBitmap::from_buffer` gained a `placeholder: bool` parameter (pass
+  `false` to decode and load the real pixels/audio, `true` for a data-less
+  placeholder used only for token counting). `run_image_inference` still
+  called it with two arguments, so the crate failed to compile under the
+  `mtmd` feature. It now passes `placeholder = false`, matching the previous
+  behaviour of decoding the actual media for multimodal inference.
+
 ## [0.2.0] — 2026-06-18
 
 ### Changed
