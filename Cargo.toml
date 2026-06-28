@@ -1,6 +1,6 @@
 [package]
 name = "rig-llama-cpp"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rig completion provider for local GGUF models via llama.cpp, with streaming, tool calling, reasoning, and multimodal (mtmd) support."
@@ -37,7 +37,7 @@ rocm = ["llama-cpp-2/rocm"]
 mtmd = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
-rig-core = "0.38.2"
+rig-core = "0.39.0"
 llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["common", "llguidance"] }
 llama-cpp-sys-2 = { version = "0.1.150", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

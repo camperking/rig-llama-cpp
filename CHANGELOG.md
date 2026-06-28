@@ -20,6 +20,20 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.3.0] — 2026-06-28
+
+### Changed
+
+- **Bumped `rig-core` to `0.39.0`.** Upstream made `GetTokenUsage::token_usage`
+  return `Usage` directly instead of `Option<Usage>`, using the zero-valued
+  `Usage::new()` as the documented sentinel for missing provider metrics. The
+  `GetTokenUsage` impl for `StreamChunk` now follows suit: when prompt and
+  completion token counts are unavailable it returns `Usage::new()` rather than
+  `None`. Because this changes the crate's public trait-impl signature, it is a
+  breaking `0.Y` release. The other breaking changes in `rig-core` 0.39 (the
+  sans-IO `AgentRun` state machine and deterministic tool registration) affect
+  the agent loop and `ToolSet`, neither of which this crate uses.
+
 ## [0.2.1] — 2026-06-18
 
 ### Fixed

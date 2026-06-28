@@ -39,9 +39,11 @@ pub struct StreamChunk {
 }
 
 impl GetTokenUsage for StreamChunk {
-    fn token_usage(&self) -> Option<Usage> {
-        let (input, output) = self.prompt_tokens.zip(self.completion_tokens)?;
-        Some(Usage {
+    fn token_usage(&self) -> Usage {
+        let Some((input, output)) = self.prompt_tokens.zip(self.completion_tokens) else {
+            return Usage::new();
+        };
+        Usage {
             input_tokens: input,
             output_tokens: output,
             total_tokens: input + output,
@@ -49,7 +51,7 @@ impl GetTokenUsage for StreamChunk {
             cache_creation_input_tokens: 0,
             tool_use_prompt_tokens: 0,
             reasoning_tokens: 0,
-        })
+        }
     }
 }
 

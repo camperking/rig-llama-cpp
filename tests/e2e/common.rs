@@ -288,9 +288,7 @@ pub async fn run_streaming_turn(
         .response
         .clone()
         .context("stream did not surface a final response chunk")?;
-    let usage = final_chunk
-        .token_usage()
-        .context("stream final response did not include token usage")?;
+    let usage = final_chunk.token_usage();
     let aggregated_text = assistant_text(&stream.choice);
 
     ensure!(saw_text_chunk, "streaming turn emitted no text chunks");

@@ -436,7 +436,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "bytemuck_derive",
- "hashbrown 0.17.1",
+ "hashbrown",
  "regex-syntax",
  "strum",
 ]
@@ -717,6 +717,10 @@ name = "futures-timer"
 version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
+dependencies = [
+ "gloo-timers",
+ "send_wrapper",
+]
 
 [[package]]
 name = "futures-util"
@@ -779,6 +783,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gloo-timers"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b995a66bb87bebce9a0f4a95aed01daca4872c050bfcb21653361c03bc35e5c"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -796,12 +812,6 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
-
-[[package]]
-name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hashbrown"
@@ -1094,12 +1104,12 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "indexmap"
-version = "2.13.1"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45a8a2b9cb3e0b0c1803dbb0758ffac5de2f425b23c28f518faabd9d805342ff"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1936,9 +1946,9 @@ dependencies = [
 
 [[package]]
 name = "rig-core"
-version = "0.38.2"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "557f11c26c2c2ea61d9cb843ce5adff138cc5785f58ff4b87d779de8acaa32ae"
+checksum = "80a4bc7a93b329c4e1a66d5fd211d79990e7331e3c701f057c29f135f548686d"
 dependencies = [
  "as-any",
  "async-stream",
@@ -1950,6 +1960,7 @@ dependencies = [
  "futures-timer",
  "glob",
  "http",
+ "indexmap",
  "mime",
  "mime_guess",
  "nanoid",
@@ -1970,9 +1981,9 @@ dependencies = [
 
 [[package]]
 name = "rig-derive"
-version = "0.38.2"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "643eb495acbd4bd5976164cd068f186d534f741def8d5d052f860266b98d07f8"
+checksum = "5531bfa887b371eab658a92de7db35003370bbeee208ff5e68bbb81a5ae92d3d"
 dependencies = [
  "convert_case",
  "deluxe",
@@ -1986,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "rig-llama-cpp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2214,6 +2225,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "send_wrapper"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f638d531eccd6e23b980caf34876660d38e265409d8e99b397ab71eb3612fad0"
 
 [[package]]
 name = "serde"
