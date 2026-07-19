@@ -20,6 +20,20 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [Unreleased]
+
+### Changed
+
+- **Bumped `rig-core` to `0.40.0`.** The library surface of this crate
+  (`CompletionModel` / `EmbeddingModel` impls) already compiles against 0.40;
+  examples and e2e tests were updated for the upstream API paper cuts that
+  do affect consumers of the agent/tool APIs:
+  - `Tool::definition` was split into synchronous `description()` /
+    `parameters()` methods (Flatten Tool metadata API).
+  - `FinalResponse` was unified into `PromptResponse`.
+  - `StreamedAssistantContent` gained an `Unknown` variant for unmodeled
+    provider output items (exhaustive matches need a new arm).
+
 ## [0.3.0] — 2026-06-28
 
 ### Changed

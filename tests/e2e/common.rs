@@ -281,6 +281,7 @@ pub async fn run_streaming_turn(
             StreamedAssistantContent::ToolCall { .. } => {}
             StreamedAssistantContent::ToolCallDelta { .. } => {}
             StreamedAssistantContent::Final(_) => {}
+            StreamedAssistantContent::Unknown(_) => {}
         }
     }
 

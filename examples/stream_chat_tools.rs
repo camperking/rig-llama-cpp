@@ -1,6 +1,5 @@
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::client::CompletionClient;
-use rig_core::completion::ToolDefinition;
 use rig_core::message::Message;
 use rig_core::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use rig_core::tool::{Tool, ToolDyn};
@@ -28,19 +27,19 @@ impl Tool for WriteFile {
     type Args = WriteFileArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_file".to_string(),
-            description: "Write the given content to the file at the given path.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" },
-                },
-                "required": ["path", "content"],
-            }),
-        }
+    fn description(&self) -> String {
+        "Write the given content to the file at the given path.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+            },
+            "required": ["path", "content"],
+        })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
