@@ -97,19 +97,44 @@ fn inject_tools_into_system(
     out
 }
 
-/// Render a portable tool-calling directive describing the available tools and
-/// how the model should emit calls. Models trained for OpenAI-style function
-/// calling (Qwen, Llama, etc.) generally honour `<tool_call>` JSON blocks
-/// described this way.
+/// Render a tool-calling directive describing the available tools and how the
+/// model should emit calls.
+///
+/// Format matches Qwen3 / Qwen3.5's official chat template (`chat_template.jinja`
+/// on Hugging Face model cards): tools inside `<tools>`, calls as
+/// `<tool_call><function=…><parameter=…>` XML — not Hermes-style JSON-in-tags.
+/// See e.g. Qwen/Qwen3.5-*-A3B `chat_template.jinja` tools branch.
 fn build_tool_directive(tools_json: &str, tool_choice: Option<&str>) -> String {
     let mut directive = String::new();
-    directive.push_str("You have access to the following tools:\n");
+    directive.push_str(
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>\n",
+    );
     directive.push_str(tools_json);
     directive.push_str(
-        "\n\nTo call a tool, respond with a JSON object of the form \
-         `{\"name\": \"<tool_name>\", \"arguments\": {<key>: <value>, ...}}` \
-         wrapped in <tool_call></tool_call> tags. You may emit multiple \
-         <tool_call> blocks. Do not place any other text inside the tags.",
+        "\n</tools>\n\n\
+         If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+         <tool_call>\n\
+         <function=example_function_name>\n\
+         <parameter=example_parameter_1>\n\
+         value_1\n\
+         </parameter>\n\
+         <parameter=example_parameter_2>\n\
+         This is the value for the second parameter\n\
+         that can span\n\
+         multiple lines\n\
+         </parameter>\n\
+         </function>\n\
+         </tool_call>\n\n\
+         <IMPORTANT>\n\
+         Reminder:\n\
+         - Function calls MUST follow the specified format: an inner <function=...></function> \
+         block must be nested within <tool_call></tool_call> XML tags\n\
+         - Required parameters MUST be specified\n\
+         - You may provide optional reasoning for your function call in natural language \
+         BEFORE the function call, but NOT after\n\
+         - If there is no function call available, answer the question like normal with your \
+         current knowledge and do not tell the user about function calls\n\
+         </IMPORTANT>",
     );
     if let Some(choice) = tool_choice
         && choice != "auto"
