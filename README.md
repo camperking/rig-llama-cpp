@@ -12,13 +12,14 @@
 </div>
 
 A [Rig](https://github.com/0xPlaygrounds/rig) completion provider that runs GGUF models locally via [llama.cpp](https://github.com/ggml-org/llama.cpp) and their Rust bindings [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs).
-Drop it in wherever you'd use a cloud provider — same `CompletionModel` trait, same agent API, but inference happens on your hardware with no API keys, no rate limits, and no data leaving the machine.
+Drop it in wherever you'd use a cloud provider — a loaded model is a Rig `Model` like any other, so it works with the same agent API — but inference happens on your hardware with no API keys, no rate limits, and no data leaving the machine.
 
 ## Usage
 
+Agents come from [`rig-agent`](https://crates.io/crates/rig-agent), Rig's agent runtime:
+
 ```rust
-use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_agent::AgentBuilder;
 use rig_llama_cpp::Client;
 
 #[tokio::main]
@@ -30,8 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .n_ctx(8192)
         .build()?;
 
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful assistant.")
         .max_tokens(512)
         .build();

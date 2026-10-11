@@ -1,8 +1,7 @@
 //! Gemma-4 E4B integration tests.
 
 use anyhow::ensure;
-use rig_core::client::CompletionClient;
-use rig_core::completion::TypedPrompt;
+use rig_agent::AgentBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serial_test::serial;
@@ -38,6 +37,7 @@ async fn gemma_thinking() -> anyhow::Result<()> {
         &model,
         "Explain why the sky is blue in one sentence.",
         "You are a helpful assistant.",
+        42,
     )
     .await?;
 
@@ -81,16 +81,16 @@ async fn gemma_tool_roundtrip() -> anyhow::Result<()> {
 async fn gemma_structured_output() -> anyhow::Result<()> {
     let path = ensure_model(&GEMMA)?;
     let (client, _model) = load_default(&path)?;
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("Extract the single person described in the user's text as structured data.")
         .max_tokens(256)
         .temperature(0.2)
         .build();
 
-    let person: ExtractedPerson = agent
-        .prompt_typed("Ada is a 36-year-old software engineer living in Berlin.")
-        .await?;
+    let person = agent
+        .prompt_typed::<ExtractedPerson>("Ada is a 36-year-old software engineer living in Berlin.")
+        .await?
+        .output;
 
     println!(
         "gemma_structured_output: name={}, age={}, occupation={}",

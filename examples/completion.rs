@@ -1,6 +1,4 @@
-use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
-use rig_core::tool::ToolDyn;
+use rig_agent::AgentBuilder;
 use rig_llama_cpp::Client;
 use serde_json::json;
 
@@ -14,12 +12,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let client = Client::builder(&model_path).n_ctx(8192).build()?;
 
-    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
-
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful ai assistant with access to tools that can provide information about the users request. Use the tools to provide accurate and helpful responses to the user.")
-        .tools(tools)
+        .tool(time::GetCurrentTime)
         .max_tokens(2048)
         .temperature(1.0)
         .additional_params(json!({ "thinking": true }))

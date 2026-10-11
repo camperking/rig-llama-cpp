@@ -3,8 +3,9 @@
 //! A [Rig](https://docs.rs/rig-core) provider that runs GGUF models locally
 //! via [llama.cpp](https://github.com/ggml-org/llama.cpp), with optional Vulkan GPU acceleration.
 //!
-//! This crate implements Rig's [`rig_core::completion::CompletionModel`] and [`rig_core::embeddings::EmbeddingModel`] traits
-//! so that any GGUF model can be used as a drop-in replacement for cloud-based providers. It supports:
+//! A loaded model is a Rig [`Model`](rig_core::Model) — a completion wire bound to an
+//! in-process runtime — so any GGUF model can stand in for a cloud provider wherever Rig
+//! takes a model (`DynModel`, `rig_agent::AgentBuilder`, …). It supports:
 //!
 //! - **Completion and streaming** — both one-shot and token-by-token responses.
 //! - **Tool calling** — models with OpenAI-compatible chat templates can invoke tools.
@@ -42,9 +43,10 @@
 //!
 //! # Quick start
 //!
+//! Agents come from the [`rig-agent`](https://docs.rs/rig-agent) crate:
+//!
 //! ```rust,no_run
-//! use rig_core::client::CompletionClient;
-//! use rig_core::completion::Prompt;
+//! use rig_agent::AgentBuilder;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,14 +54,13 @@
 //!     .n_ctx(8192)
 //!     .build()?;
 //!
-//! let agent = client
-//!     .agent("local")
+//! let agent = AgentBuilder::new(client.completion_model("local"))
 //!     .preamble("You are a helpful assistant.")
 //!     .max_tokens(512)
 //!     .build();
 //!
 //! let response = agent.prompt("Hello!").await?;
-//! println!("{response}");
+//! println!("{}", response.output());
 //! # Ok(())
 //! # }
 //! ```
@@ -78,15 +79,19 @@ mod request;
 mod sampling;
 mod slot;
 mod types;
+mod wire;
 mod worker;
 
-pub use client::{Client, ClientBuilder, Model};
-pub use embedding::{EmbeddingClient, EmbeddingModelHandle};
+pub use client::{Client, ClientBuilder};
+pub use embedding::{EmbeddingClient, EmbeddingModelHandle, EmbeddingRuntime};
 pub use error::LoadError;
 pub use types::{
-    CheckpointParams, FitParams, KvCacheParams, KvCacheType, RawResponse, SamplingParams,
-    StreamChunk,
+    CheckpointParams, FitParams, Frame, KvCacheParams, KvCacheType, RawResponse, SamplingParams,
 };
+pub use wire::{CompletionWire, FrameDecoder, Model, RawDocument, Runtime};
+
+/// The provider name this crate's models report to Rig.
+pub(crate) const PROVIDER: &str = "llama.cpp";
 
 fn env_flag_enabled(name: &str) -> bool {
     match std::env::var(name) {

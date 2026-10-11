@@ -519,7 +519,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "[call:schema:{\"kind\":\"asset\"}][tool_response:{\"fields\":[]}]"
+            // `tojson` spaces its output as Python's `json.dumps` does.
+            "[call:schema:{\"kind\": \"asset\"}][tool_response:{\"fields\":[]}]"
         );
     }
 
@@ -603,7 +604,10 @@ mod tests {
     fn qwen3s_own_template_renders_the_tool_call_it_made() {
         let out = render_native(QWEN3, None);
         // The tool is advertised natively, in the model's own <tools> block.
-        assert!(out.contains("\"name\":\"schema\""), "tools missing:\n{out}");
+        assert!(
+            out.contains("\"name\": \"schema\""),
+            "tools missing:\n{out}"
+        );
         // Qwen3.6 asks for the `<function=…><parameter=…>` form rather than
         // the JSON one, and renders history the same way.
         assert!(

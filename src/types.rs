@@ -1,62 +1,72 @@
-use rig_core::completion::{CompletionError, GetTokenUsage, Usage};
-use rig_core::message::AssistantContent;
-use rig_core::one_or_many::OneOrMany;
-use rig_core::streaming::RawStreamingChoice;
+use rig_core::error::ProviderError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-/// Raw completion response returned by the model.
+/// The provider document of a reply: what [`CompletionResponse::raw`]
+/// holds for every completion this crate produces, unary or streamed.
 ///
+/// Read it back with `serde_json::from_value::<RawResponse>(response.raw)`.
 /// Marked `#[non_exhaustive]` because new fields may be added in future
 /// minor releases.
+///
+/// [`CompletionResponse::raw`]: rig_core::completion::CompletionResponse::raw
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RawResponse {
-    /// The full generated text.
+    /// The full generated text, exactly as the model produced it.
     pub text: String,
 }
 
-/// A single chunk emitted during streaming inference.
+/// One block of a turn as the worker parsed it, before rig assembles it into
+/// the response.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OutputPart {
+    /// Answer text. Consecutive text parts extend one text block.
+    Text(String),
+    /// A whole reasoning block.
+    Reasoning(String),
+    /// A whole tool call.
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+/// How a reply ended: token counts and the raw generated text.
+#[derive(Clone, Debug)]
+pub(crate) struct Done {
+    pub text: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Tokens of the prompt that were already present in the persistent KV cache
+    /// (i.e. the longest common prefix shared with the previous request).
+    pub cached_input_tokens: u64,
+}
+
+/// One step of a reply, as the inference worker delivers it to the
+/// [`CompletionWire`](crate::CompletionWire) decoder.
 ///
-/// The final chunk in a stream includes token usage counts. Marked
-/// `#[non_exhaustive]` because new fields may be added in future minor
-/// releases.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct StreamChunk {
-    /// The text fragment for this chunk.
-    pub text: String,
-    /// Number of prompt tokens (only set on the final chunk).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens: Option<u64>,
-    /// Number of completion tokens (only set on the final chunk).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion_tokens: Option<u64>,
-    /// Number of prompt tokens that were served from the persistent KV-cache prefix
-    /// (only set on the final chunk).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_input_tokens: Option<u64>,
+/// Opaque: frames only travel between this crate's runtime and its wire.
+#[derive(Clone, Debug)]
+pub struct Frame(pub(crate) FrameKind);
+
+#[derive(Clone, Debug)]
+pub(crate) enum FrameKind {
+    Part(OutputPart),
+    End(Done),
 }
 
-impl GetTokenUsage for StreamChunk {
-    fn token_usage(&self) -> Usage {
-        let Some((input, output)) = self.prompt_tokens.zip(self.completion_tokens) else {
-            return Usage::new();
-        };
-        Usage {
-            input_tokens: input,
-            output_tokens: output,
-            total_tokens: input + output,
-            cached_input_tokens: self.cached_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: 0,
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        }
+pub(crate) type StreamSender = mpsc::UnboundedSender<Result<Frame, ProviderError>>;
+
+impl Frame {
+    pub(crate) fn part(part: OutputPart) -> Self {
+        Self(FrameKind::Part(part))
+    }
+
+    pub(crate) fn end(done: Done) -> Self {
+        Self(FrameKind::End(done))
     }
 }
-
-pub(crate) type StreamSender =
-    mpsc::UnboundedSender<Result<RawStreamingChoice<StreamChunk>, CompletionError>>;
 
 pub(crate) enum ResponseChannel {
     Completion(oneshot::Sender<Result<InferenceResult, String>>),
@@ -93,16 +103,15 @@ pub(crate) struct InferenceParams {
     pub min_p: f32,
     pub presence_penalty: f32,
     pub repetition_penalty: f32,
+    /// Seed of the final `dist` sampler.
+    pub seed: u32,
 }
 
 pub(crate) struct InferenceResult {
-    pub text: String,
-    pub choice: OneOrMany<AssistantContent>,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    /// Tokens of the prompt that were already present in the persistent KV cache
-    /// (i.e. the longest common prefix shared with the previous request).
-    pub cached_input_tokens: u64,
+    /// The parsed blocks of a unary turn. Empty for a streamed turn, whose
+    /// blocks already went out as frames.
+    pub parts: Vec<OutputPart>,
+    pub done: Done,
 }
 
 pub(crate) struct PreparedRequest {

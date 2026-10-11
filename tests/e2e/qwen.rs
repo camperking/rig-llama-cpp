@@ -1,8 +1,8 @@
 //! Qwen 3.5-2B integration tests.
 
 use anyhow::ensure;
-use rig_core::client::CompletionClient;
-use rig_core::completion::{CompletionModel, TypedPrompt};
+use rig_agent::AgentBuilder;
+use rig_core::completion::CompletionRequest;
 use rig_llama_cpp::{
     CheckpointParams, Client, FitParams, KvCacheParams, KvCacheType, SamplingParams,
 };
@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serial_test::serial;
 
 use super::common::{
-    QWEN, completion_with_thinking, ensure_model, env_parse_u32, load_default, run_long_e2e,
-    run_streamed_structured, tool_roundtrip,
+    QWEN, completion_with_thinking, ensure_model, env_parse_u32, load_default, raw_text,
+    run_long_e2e, run_streamed_structured, tool_roundtrip,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -50,17 +50,19 @@ async fn kv_cache_q8_0_qwen() -> anyhow::Result<()> {
     let model = client.completion_model("local");
 
     let response = model
-        .completion_request("Reply with exactly: kv cache ok")
-        .max_tokens(32)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new("Reply with exactly: kv cache ok")
+                .max_tokens(32)
+                .temperature(0.0),
+        )
         .await?;
+    let text = raw_text(&response);
     ensure!(
-        !response.raw_response.text.trim().is_empty(),
+        !text.trim().is_empty(),
         "Q8_0 KV cache completion returned empty text"
     );
 
-    println!("Q8_0 KV cache response: {}", response.raw_response.text);
+    println!("Q8_0 KV cache response: {text}");
     Ok(())
 }
 
@@ -74,6 +76,8 @@ async fn qwen_thinking() -> anyhow::Result<()> {
         &model,
         "Explain why the sky is blue in one sentence.",
         "You are a helpful assistant.",
+        // Seed 42, the sampler default, samples a run that skips thinking.
+        1,
     )
     .await?;
 
@@ -124,20 +128,19 @@ async fn qwen_tool_roundtrip() -> anyhow::Result<()> {
 async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
     use anyhow::Context;
     use rig_core::completion::ToolDefinition;
-    use rig_core::message::{AssistantContent, Message, ToolResultContent, UserContent};
-    use rig_core::one_or_many::OneOrMany;
+    use rig_core::message::{AssistantContent, Message, ToolName, ToolResultContent};
     use serde_json::json;
 
     let path = ensure_model(&QWEN)?;
     let (_client, model) = load_default(&path)?;
 
     let get_time = ToolDefinition {
-        name: "get_time".to_string(),
+        name: ToolName::new("get_time")?,
         description: "Return the current UTC time as plain text.".to_string(),
         parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
     };
     let save_time = ToolDefinition {
-        name: "save_time".to_string(),
+        name: ToolName::new("save_time")?,
         description: "Persist a time string. Call this after get_time.".to_string(),
         parameters: json!({
             "type": "object",
@@ -151,13 +154,14 @@ async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
     let task = "Find the current time with get_time, then store it with save_time.";
 
     let first = model
-        .completion_request(task)
-        .preamble(preamble.to_string())
-        .tool(get_time.clone())
-        .tool(save_time.clone())
-        .max_tokens(256)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new(task)
+                .preamble(preamble)
+                .tool(get_time.clone())
+                .tool(save_time.clone())
+                .max_tokens(256)
+                .temperature(0.0),
+        )
         .await?;
 
     let call = first
@@ -169,28 +173,25 @@ async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
         })
         .context("model did not produce a first tool call")?;
     ensure!(
-        call.function.name == "get_time",
+        call.function.name.as_str() == "get_time",
         "expected get_time first, got {}",
-        call.function.name
+        call.function.name.as_str()
     );
 
-    let result = Message::from(UserContent::tool_result_with_call_id(
-        "tool-result-utc",
-        call.call_id.clone().unwrap_or_else(|| call.id.clone()),
-        OneOrMany::one(ToolResultContent::text(
-            "Current time: 2026-04-12 15:30:00 UTC",
-        )),
-    ));
+    let result = Message::from(call.result(vec![ToolResultContent::text(
+        "Current time: 2026-04-12 15:30:00 UTC",
+    )]));
 
     let second = model
-        .completion_request("Continue.")
-        .preamble(preamble.to_string())
-        .tool(get_time)
-        .tool(save_time)
-        .messages(vec![Message::user(task), Message::from(call), result])
-        .max_tokens(256)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new("Continue.")
+                .preamble(preamble)
+                .tool(get_time)
+                .tool(save_time)
+                .messages(vec![Message::user(task), Message::from(call), result])
+                .max_tokens(256)
+                .temperature(0.0),
+        )
         .await?;
 
     let follow_up = second
@@ -206,12 +207,13 @@ async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
         )?;
     println!(
         "qwen_calls_a_second_tool_after_a_result: second call={} args={}",
-        follow_up.function.name, follow_up.function.arguments
+        follow_up.function.name.as_str(),
+        serde_json::Value::Object(follow_up.function.arguments.clone())
     );
     ensure!(
-        follow_up.function.name == "save_time",
+        follow_up.function.name.as_str() == "save_time",
         "expected save_time second, got {}",
-        follow_up.function.name
+        follow_up.function.name.as_str()
     );
     Ok(())
 }
@@ -226,14 +228,14 @@ async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
 async fn qwen_passes_an_object_valued_argument() -> anyhow::Result<()> {
     use anyhow::Context;
     use rig_core::completion::ToolDefinition;
-    use rig_core::message::AssistantContent;
+    use rig_core::message::{AssistantContent, ToolName};
     use serde_json::{Value, json};
 
     let path = ensure_model(&QWEN)?;
     let (_client, model) = load_default(&path)?;
 
     let update_entity = ToolDefinition {
-        name: "update_entity".to_string(),
+        name: ToolName::new("update_entity")?,
         description: "Update fields on an entity.".to_string(),
         parameters: json!({
             "type": "object",
@@ -250,12 +252,13 @@ async fn qwen_passes_an_object_valued_argument() -> anyhow::Result<()> {
     };
 
     let response = model
-        .completion_request("Set the Vendor field of asset ABB1-NTP1 to Meinberg.")
-        .preamble("You have access to tools. Use them when needed.".to_string())
-        .tool(update_entity)
-        .max_tokens(256)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new("Set the Vendor field of asset ABB1-NTP1 to Meinberg.")
+                .preamble("You have access to tools. Use them when needed.")
+                .tool(update_entity)
+                .max_tokens(256)
+                .temperature(0.0),
+        )
         .await?;
 
     let call = response
@@ -268,7 +271,7 @@ async fn qwen_passes_an_object_valued_argument() -> anyhow::Result<()> {
         .context("model did not produce a tool call")?;
     println!(
         "qwen_passes_an_object_valued_argument: args={}",
-        call.function.arguments
+        Value::Object(call.function.arguments.clone())
     );
 
     let fields = call
@@ -290,16 +293,16 @@ async fn qwen_passes_an_object_valued_argument() -> anyhow::Result<()> {
 async fn qwen_structured_output() -> anyhow::Result<()> {
     let path = ensure_model(&QWEN)?;
     let (client, _model) = load_default(&path)?;
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("Extract the single person described in the user's text as structured data.")
         .max_tokens(256)
         .temperature(0.2)
         .build();
 
-    let person: ExtractedPerson = agent
-        .prompt_typed("Ada is a 36-year-old software engineer living in Berlin.")
-        .await?;
+    let person = agent
+        .prompt_typed::<ExtractedPerson>("Ada is a 36-year-old software engineer living in Berlin.")
+        .await?
+        .output;
 
     println!(
         "qwen_structured_output: name={}, age={}, occupation={}",
@@ -329,7 +332,7 @@ async fn vision_basic_qwen() -> anyhow::Result<()> {
 
 /// Streaming structured-output over a runtime-built schema. Mirrors the
 /// path `chatty` takes for workflow agents (schema set on
-/// `AgentBuilder`, response consumed via `stream_chat`, accumulated
+/// `AgentBuilder`, response consumed as a stream, accumulated
 /// text parsed as JSON afterwards). Regression guard: previously
 /// passed for Qwen but broke on Gemma; we keep both tests so divergence
 /// surfaces here next time.

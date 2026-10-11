@@ -1,7 +1,5 @@
-use rig_core::completion::CompletionRequest;
-use rig_core::message::{AssistantContent, Message, ToolCall, UserContent};
-#[cfg(feature = "mtmd")]
-use rig_core::one_or_many::OneOrMany;
+use rig_core::completion::{CompletionRequest, Reasoning};
+use rig_core::message::{AssistantContent, Message, ToolCall, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 
 #[cfg(feature = "mtmd")]
@@ -10,67 +8,14 @@ use crate::slot::fnv1a_64;
 use crate::types::PreparedImage;
 use crate::types::PreparedRequest;
 
-/// Normalize a tool result's content list. rig-core 0.35.0's streaming agent
-/// loop stored the raw tool-output string as plain `ToolResultContent::Text`
-/// in the chat history it sent to the next provider call, while its
-/// non-streaming counterpart called `ToolResultContent::from_tool_output` to
-/// parse image JSON into `Image` variants. Upstream rig-core 0.36.0 fixed
-/// this (see rig PR #1661 / issue #1650), so the streaming and non-streaming
-/// paths now agree. This helper is kept as a defensive pass: if a caller
-/// hands us a history produced by an older rig-core, or by some other agent
-/// that still emits raw Text for image tool outputs, we re-parse here so
-/// image content surfaces as `ToolResultContent::Image`. No-op for plain-text
-/// outputs: `from_tool_output` falls back to a single Text part on parse
-/// failure.
+/// Turn a request into the chat-template inputs.
 ///
-/// Only used by mtmd-aware code paths — without `mtmd` enabled, tool images
-/// can't be sent to the model anyway.
-#[cfg(feature = "mtmd")]
-fn normalized_tool_parts(
-    content: &OneOrMany<rig_core::message::ToolResultContent>,
-) -> Vec<rig_core::message::ToolResultContent> {
-    let mut out = Vec::new();
-    for part in content.iter() {
-        match part {
-            rig_core::message::ToolResultContent::Text(t) => {
-                let parsed = rig_core::message::ToolResultContent::from_tool_output(t.text.clone());
-                for p in parsed.into_iter() {
-                    out.push(p);
-                }
-            }
-            other => out.push(other.clone()),
-        }
-    }
-    out
-}
-
+/// The request arrives prepared by rig's completion operation: the preamble
+/// is the leading `Message::System` of `chat_history`, any documents have
+/// joined the history as a user message, and the history is adapted to what
+/// [`CompletionWire`](crate::CompletionWire) accepts.
 pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedRequest, String> {
     let mut messages = Vec::new();
-
-    let mut system = request.preamble.clone().unwrap_or_default();
-    if let Some(Message::User { content }) = request.normalized_documents() {
-        let doc_text: String = content
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !doc_text.is_empty() {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(&doc_text);
-        }
-    }
-
-    if !system.is_empty() {
-        messages.push(json!({
-            "role": "system",
-            "content": system,
-        }));
-    }
 
     for msg in request.chat_history.iter() {
         append_message_json(&mut messages, msg);
@@ -88,7 +33,7 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
                         json!({
                             "type": "function",
                             "function": {
-                                "name": tool.name,
+                                "name": tool.name.as_str(),
                                 "description": tool.description,
                                 "parameters": tool.parameters,
                             }
@@ -135,10 +80,10 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
                             // Tool results can carry image content (e.g. a `read_file`
                             // tool that reads a `.png`). Bitmap ordering must match the
                             // order media markers appear in `append_message_json`, so we
-                            // walk the normalized parts here in the same iteration order.
-                            for part in normalized_tool_parts(&tool_result.content) {
-                                if let rig_core::message::ToolResultContent::Image(image) = part {
-                                    match extract_image_bytes(&image) {
+                            // walk the parts here in the same iteration order.
+                            for part in &tool_result.content {
+                                if let ToolResultContent::Image(image) = part {
+                                    match extract_image_bytes(image) {
                                         Ok(bytes) => {
                                             let hash = fnv1a_64(&bytes);
                                             imgs.push(PreparedImage { bytes, hash });
@@ -166,10 +111,7 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
         tools_json,
         tool_choice,
         json_schema,
-        enable_thinking: request
-            .additional_params
-            .as_ref()
-            .and_then(thinking_preference),
+        enable_thinking: thinking_preference(request),
         #[cfg(feature = "mtmd")]
         images,
     })
@@ -270,10 +212,10 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                         .iter()
                         .map(|tr| {
                             json!({
-                                "id": tr.call_id.as_deref().unwrap_or(&tr.id),
+                                "id": tr.call.wire(),
                                 "type": "function",
                                 "function": {
-                                    "name": tr.id,
+                                    "name": tr.name.as_str(),
                                     "arguments": "{}",
                                 }
                             })
@@ -291,40 +233,18 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                 let mut pending_tool_image_count: usize = 0;
 
                 for tool_result in tool_results {
-                    #[cfg(feature = "mtmd")]
-                    let normalized = normalized_tool_parts(&tool_result.content);
-
-                    #[cfg(feature = "mtmd")]
-                    let content = normalized
-                        .iter()
-                        .filter_map(|part| match part {
-                            rig_core::message::ToolResultContent::Text(text) => {
-                                Some(text.text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    #[cfg(not(feature = "mtmd"))]
                     let content = tool_result
                         .content
                         .iter()
-                        .filter_map(|part| match part {
-                            rig_core::message::ToolResultContent::Text(text) => {
-                                Some(text.text.as_str())
-                            }
-                            _ => None,
-                        })
+                        .filter_map(tool_result_text)
                         .collect::<Vec<_>>()
                         .join("\n");
 
                     #[cfg(feature = "mtmd")]
-                    let image_count = normalized
+                    let image_count = tool_result
+                        .content
                         .iter()
-                        .filter(|part| {
-                            matches!(part, rig_core::message::ToolResultContent::Image(_))
-                        })
+                        .filter(|part| matches!(part, ToolResultContent::Image(_)))
                         .count();
 
                     #[cfg(feature = "mtmd")]
@@ -343,7 +263,7 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
 
                     messages.push(json!({
                         "role": "tool",
-                        "tool_call_id": tool_result.call_id.as_deref().unwrap_or(&tool_result.id),
+                        "tool_call_id": tool_result.call.wire(),
                         "content": final_content,
                     }));
 
@@ -380,7 +300,8 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
                 }
             }
         }
-        Message::Assistant { content, .. } => {
+        Message::Assistant(assistant) => {
+            let content = &assistant.content;
             let text = content
                 .iter()
                 .filter_map(|c| match c {
@@ -416,6 +337,16 @@ fn append_message_json(messages: &mut Vec<Value>, msg: &Message) {
     }
 }
 
+/// The text a tool result part contributes to a `role: "tool"` message.
+/// Structured JSON is sent as its JSON text; images travel separately.
+fn tool_result_text(part: &ToolResultContent) -> Option<String> {
+    match part {
+        ToolResultContent::Text(text) => Some(text.text.clone()),
+        ToolResultContent::Json { value } => Some(value.to_string()),
+        ToolResultContent::Image(_) => None,
+    }
+}
+
 fn user_content_text(content: &UserContent) -> Option<String> {
     match content {
         UserContent::Text(text) => Some(text.text.clone()),
@@ -428,29 +359,24 @@ fn document_text(document: &rig_core::message::Document) -> String {
     match &document.data {
         rig_core::message::DocumentSourceKind::String(text)
         | rig_core::message::DocumentSourceKind::Url(text)
-        | rig_core::message::DocumentSourceKind::Base64(text) => text.clone(),
+        | rig_core::message::DocumentSourceKind::Base64(text)
+        | rig_core::message::DocumentSourceKind::FileId(text) => text.clone(),
         rig_core::message::DocumentSourceKind::Raw(bytes) => {
             String::from_utf8_lossy(bytes).into_owned()
         }
         rig_core::message::DocumentSourceKind::Unknown => String::new(),
-        _ => String::new(),
     }
 }
 
 fn tool_call_json(tool_call: &ToolCall) -> Value {
-    // Args may already be a JSON-encoded string (parser fallback for partial output).
-    // Re-encoding via `.to_string()` would double-quote it; an invalid string would
-    // crash the chat template renderer. Pass valid JSON through, swap the rest for "{}".
-    let arguments = match &tool_call.function.arguments {
-        Value::String(s) if serde_json::from_str::<Value>(s).is_ok() => s.clone(),
-        Value::String(_) => "{}".to_string(),
-        other => other.to_string(),
-    };
+    // rig keeps arguments as a JSON object (malformed ones arrive as `{}`), so
+    // the encoded text is always valid JSON for the chat template to render.
+    let arguments = Value::Object(tool_call.function.arguments.clone()).to_string();
     json!({
-        "id": tool_call.id,
+        "id": tool_call.id.wire(),
         "type": "function",
         "function": {
-            "name": tool_call.function.name,
+            "name": tool_call.function.name.as_str(),
             "arguments": arguments,
         }
     })
@@ -476,13 +402,93 @@ fn extract_image_bytes(image: &rig_core::message::Image) -> Result<Vec<u8>, Stri
 
 /// The caller's reasoning preference, or `None` if they expressed none.
 ///
+/// Read from the portable `reasoning` option first: `Reasoning::Off` turns
+/// thinking off and any effort or budget turns it on. A boolean `reasoning`
+/// or `thinking` key in `additional_params` is still honoured when the
+/// option is unset.
+///
 /// The distinction matters: a template that gates reasoning on
 /// `enable_thinking is defined` reads an unconditional `false` as "thinking
 /// off", which is not what an absent parameter means. See
 /// [`crate::types::PreparedRequest::enable_thinking`].
-fn thinking_preference(params: &Value) -> Option<bool> {
+fn thinking_preference(request: &CompletionRequest) -> Option<bool> {
+    if let Some(reasoning) = &request.options.reasoning {
+        return Some(!matches!(reasoning, Reasoning::Off));
+    }
+    let params = request.additional_params.as_ref()?;
     params
         .get("reasoning")
         .or_else(|| params.get("thinking"))
         .and_then(Value::as_bool)
+}
+
+#[cfg(test)]
+mod tests {
+    use rig_core::completion::{CompletionRequest, Effort, Reasoning};
+    use rig_core::message::{Message, ToolCall, ToolFunction, ToolName, ToolResultContent};
+    use serde_json::{Value, json};
+
+    use super::prepare_request;
+
+    fn messages(request: &CompletionRequest) -> Vec<Value> {
+        let prepared = prepare_request(request).unwrap();
+        serde_json::from_str(&prepared.messages_json).unwrap()
+    }
+
+    #[test]
+    fn the_preamble_renders_as_the_leading_system_message() {
+        let request = CompletionRequest::new("hi").preamble("Be brief.");
+        let messages = messages(&request);
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Be brief."})
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn a_tool_result_answers_the_call_it_names() {
+        let call = ToolCall::from_wire(
+            "",
+            ToolFunction::new(ToolName::new("get_time").unwrap(), json!({"zone": "UTC"})),
+        );
+        let result = Message::from(call.result(vec![ToolResultContent::text("12:00")]));
+        let request = CompletionRequest::new("Continue.").messages([
+            Message::user("What time is it?"),
+            Message::from(call.clone()),
+            result,
+        ]);
+        let messages = messages(&request);
+
+        let id = call.id.wire().into_owned();
+        let tool_call = &messages[1]["tool_calls"][0];
+        assert_eq!(tool_call["id"], json!(id));
+        assert_eq!(tool_call["function"]["name"], "get_time");
+        // Templates expect the arguments as JSON text.
+        assert_eq!(tool_call["function"]["arguments"], "{\"zone\":\"UTC\"}");
+        assert_eq!(
+            messages[2],
+            json!({"role": "tool", "tool_call_id": id, "content": "12:00"})
+        );
+    }
+
+    #[test]
+    fn the_reasoning_option_sets_the_thinking_preference() {
+        let prepare = |request: CompletionRequest| prepare_request(&request).unwrap();
+        assert_eq!(prepare(CompletionRequest::new("hi")).enable_thinking, None);
+        assert_eq!(
+            prepare(CompletionRequest::new("hi").reasoning(Reasoning::Off)).enable_thinking,
+            Some(false)
+        );
+        assert_eq!(
+            prepare(CompletionRequest::new("hi").reasoning(Effort::High)).enable_thinking,
+            Some(true)
+        );
+        // The pre-0.6 `additional_params` switch still works.
+        assert_eq!(
+            prepare(CompletionRequest::new("hi").additional_params(json!({"thinking": false})))
+                .enable_thinking,
+            Some(false)
+        );
+    }
 }

@@ -9,11 +9,11 @@ fn main() {
 #[cfg(feature = "mtmd")]
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    use rig_core::OneOrMany;
-    use rig_core::client::CompletionClient;
-    use rig_core::completion::CompletionModel;
+    use rig_core::completion::CompletionRequest;
     use rig_core::message::{DocumentSourceKind, Image, ImageMediaType, Message, UserContent};
-    use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
+    use rig_llama_cpp::{
+        CheckpointParams, Client, FitParams, KvCacheParams, RawResponse, SamplingParams,
+    };
 
     let model_path =
         std::env::var("MODEL_PATH").expect("Set MODEL_PATH env var to your vision GGUF model");
@@ -36,23 +36,22 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let model = client.completion_model("local");
 
-    let response = model
-        .completion_request("Describe this image.")
-        .preamble("You are a helpful assistant that can describe images.".to_string())
-        .messages(vec![Message::from(OneOrMany::many(vec![
+    let request = CompletionRequest::new("Describe this image.")
+        .preamble("You are a helpful assistant that can describe images.")
+        .messages(vec![Message::from(vec![
             UserContent::Image(Image {
                 media_type: Some(ImageMediaType::PNG),
                 data: DocumentSourceKind::Raw(image_bytes),
                 detail: None,
-                additional_params: None,
+                native: None,
             }),
             UserContent::text("What do you see in this image? Describe it in detail."),
-        ])?)])
-        .max_tokens(512)
-        .send()
-        .await?;
+        ])])
+        .max_tokens(512);
+    let response = model.call(request).await?;
 
-    println!("{}", response.raw_response.text);
+    let raw: RawResponse = serde_json::from_value(response.raw)?;
+    println!("{}", raw.text);
 
     Ok(())
 }

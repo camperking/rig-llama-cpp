@@ -20,6 +20,43 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.6.0] — 2026-10-11
+
+### Changed (breaking)
+
+- **Rig 0.44.** `rig-core` 0.43 replaced the `CompletionModel` /
+  `CompletionClient` / `EmbeddingModel` traits with a wire-and-transport
+  driver, and moved the agent builder into the separate `rig-agent` crate.
+  A loaded model is now a `rig_core::Model`:
+  - `Client::completion_model(id)` returns `rig_llama_cpp::Model`, an alias
+    for `rig_core::Model<CompletionWire, Runtime>`. Call it directly
+    (`model.call(request)`, `model.stream(request)`) or pass it to
+    `rig_agent::AgentBuilder::new`. `client.agent(..)` is gone with the trait
+    that provided it.
+  - `EmbeddingClient::embedding_model(id)` returns `EmbeddingModelHandle`, now
+    an alias for `rig_core::Model<Local<Embedding>, EmbeddingRuntime>`.
+    `embed_text` is unchanged; batches go through `call(texts)` and the width
+    is `capabilities().ndims`.
+  - `StreamChunk` is removed. Streams end in Rig's own response, and the
+    model's raw output text is `CompletionResponse::raw`, which deserializes
+    into `RawResponse` for unary and streamed turns alike.
+  - Tool calls carry Rig-issued ids (`CallId`) instead of `tool-call-N`.
+- **The portable generation options are honoured:** `reasoning` sets the chat
+  template's `enable_thinking` (`Reasoning::Off` turns it off), and `top_p`
+  and `seed` override the sampler. `stop`, `cache`, `service_tier`,
+  `verbosity` and `parallel_tool_calls` are refused as unsupported. The
+  `additional_params` `thinking` / `reasoning` switch still works.
+- **MSRV is 1.95**, as `rig-core` 0.44 requires.
+- **`llama-cpp-2` / `llama-cpp-sys-2` 0.1.159.** Tokenization moved to
+  `LlamaVocab`. The repetition/presence penalty window is now passed as the
+  context size explicitly: llama.cpp no longer reads `-1` as "whole context"
+  and would otherwise have disabled the penalties.
+- **`minijinja` 3.0.** Its `tojson` now spaces output the way Python's
+  `json.dumps` does (`{"a": 1}`), matching how Hugging Face renders the same
+  chat templates, and `none` prints as `None`.
+- `llguidance` 1.9, `thiserror` 2.0.21, `chrono` 0.4.45, `base64` 0.23;
+  dev-dependencies `hf-hub` 1.0 and `rig-agent` 0.44.
+
 ## [0.5.1] — 2026-07-27
 
 ### Fixed

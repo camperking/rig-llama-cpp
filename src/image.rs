@@ -39,9 +39,10 @@ pub(crate) fn run_image_inference<'m>(
     // The worker dispatches here only when `ctx.mtmd_ctx.is_some()`, but
     // return a typed error rather than panicking if a future refactor breaks
     // that contract — the worker thread is the only one that can recover.
-    let mtmd = ctx
+    let mut mtmd = ctx
         .mtmd_ctx
-        .ok_or_else(|| "BUG: run_image_inference called without mtmd context".to_string())?;
+        .ok_or_else(|| "BUG: run_image_inference called without mtmd context".to_string())?
+        .borrow_mut();
 
     // Build bitmaps and stamp each with the FNV id so chunk ids round-trip.
     let bitmaps: Vec<llama_cpp_2::mtmd::MtmdBitmap> = req
@@ -49,7 +50,7 @@ pub(crate) fn run_image_inference<'m>(
         .images
         .iter()
         .map(|img| -> Result<_, String> {
-            let bm = llama_cpp_2::mtmd::MtmdBitmap::from_buffer(mtmd, &img.bytes, false)
+            let mut bm = llama_cpp_2::mtmd::MtmdBitmap::from_buffer(&mtmd, &img.bytes, false)
                 .map_err(|e| format!("Failed to create bitmap from image data: {e}"))?;
             bm.set_id(&format!("{:016x}", img.hash))
                 .map_err(|e| format!("Failed to set bitmap id: {e}"))?;
@@ -117,7 +118,7 @@ pub(crate) fn run_image_inference<'m>(
         p.last_entries.clear();
         p.clear_checkpoints();
         let n_past = chunks
-            .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
+            .eval_chunks(&mut mtmd, &mut p.ctx, 0, 0, n_batch, true)
             .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
         (0usize, n_past)
     } else {
@@ -140,7 +141,7 @@ pub(crate) fn run_image_inference<'m>(
                     p.last_entries.clear();
                     p.clear_checkpoints();
                     let n_past = chunks
-                        .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
+                        .eval_chunks(&mut mtmd, &mut p.ctx, 0, 0, n_batch, true)
                         .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                     return finish_image_sample(
                         &ctx.model_env(),
@@ -176,7 +177,7 @@ pub(crate) fn run_image_inference<'m>(
                     p.last_entries.clear();
                     p.clear_checkpoints();
                     let n_past = chunks
-                        .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
+                        .eval_chunks(&mut mtmd, &mut p.ctx, 0, 0, n_batch, true)
                         .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                     return finish_image_sample(
                         &ctx.model_env(),

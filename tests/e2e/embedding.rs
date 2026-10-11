@@ -1,7 +1,6 @@
 //! Embedding integration test.
 
 use anyhow::ensure;
-use rig_core::embeddings::EmbeddingModel as _;
 use rig_llama_cpp::EmbeddingClient;
 use serial_test::serial;
 
@@ -18,14 +17,15 @@ async fn embedding_basic() -> anyhow::Result<()> {
     let client =
         EmbeddingClient::from_gguf(path.to_string_lossy().into_owned(), n_gpu_layers, n_ctx)?;
     let model = client.embedding_model("local");
+    let ndims = model.capabilities().ndims;
 
     // Single text embedding
     let emb = model.embed_text("Hello, world!").await?;
     ensure!(
-        emb.vec.len() == model.ndims(),
+        emb.vec.len() == ndims,
         "embedding dimension mismatch: got {}, expected {}",
         emb.vec.len(),
-        model.ndims()
+        ndims
     );
     ensure!(
         emb.vec.iter().any(|v| *v != 0.0),
@@ -34,12 +34,13 @@ async fn embedding_basic() -> anyhow::Result<()> {
 
     // Multiple texts
     let embeddings = model
-        .embed_texts(vec![
+        .call(vec![
             "The cat sat on the mat.".to_string(),
             "Dogs are loyal animals.".to_string(),
             "The weather is sunny today.".to_string(),
         ])
-        .await?;
+        .await?
+        .embeddings;
     ensure!(
         embeddings.len() == 3,
         "expected 3 embeddings, got {}",
@@ -47,16 +48,16 @@ async fn embedding_basic() -> anyhow::Result<()> {
     );
     for (i, emb) in embeddings.iter().enumerate() {
         ensure!(
-            emb.vec.len() == model.ndims(),
+            emb.vec.len() == ndims,
             "embedding {i} dimension mismatch: got {}, expected {}",
             emb.vec.len(),
-            model.ndims()
+            ndims
         );
     }
 
     println!(
         "Embedding test passed: ndims={}, single_ok=true, batch_count={}",
-        model.ndims(),
+        ndims,
         embeddings.len()
     );
 

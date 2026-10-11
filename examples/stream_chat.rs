@@ -1,7 +1,5 @@
-use rig_core::client::CompletionClient;
+use rig_agent::AgentBuilder;
 use rig_core::message::Message;
-use rig_core::streaming::StreamingChat;
-use rig_core::tool::ToolDyn;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde_json::json;
 
@@ -25,12 +23,9 @@ async fn main() -> Result<(), anyhow::Error> {
         CheckpointParams::default(),
     )?;
 
-    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(time::GetCurrentTime)];
-
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful ai assistant with access to tools that can provide information about the users request. Use the tools to provide accurate and helpful responses to the user.")
-        .tools(tools)
+        .tool(time::GetCurrentTime)
         .max_tokens(2048)
         .temperature(1.0)
         .additional_params(json!({ "thinking": true }))
@@ -42,7 +37,7 @@ async fn main() -> Result<(), anyhow::Error> {
     ];
 
     // Prompt the agent and print the response
-    let mut stream = agent.stream_chat("Entertain me!", messages).await;
+    let mut stream = agent.prompt("Entertain me!").history(messages).stream();
 
     let res = stream_out::stream_out(&mut stream).await.unwrap();
 

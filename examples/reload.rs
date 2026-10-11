@@ -1,5 +1,4 @@
-use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_agent::AgentBuilder;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 
 #[tokio::main]
@@ -18,8 +17,7 @@ async fn main() -> Result<(), anyhow::Error> {
         CheckpointParams::default(),
     )?;
 
-    let response_a = client
-        .agent("local")
+    let response_a = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful assistant. Answer in one short sentence.")
         .max_tokens(128)
         .build()
@@ -41,8 +39,9 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .map_err(anyhow::Error::msg)?;
 
-    let response_b = client
-        .agent("local")
+    // Take a fresh model handle: a handle snapshots the client's sampling
+    // parameters when it is created.
+    let response_b = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful assistant. Answer in one short sentence.")
         .max_tokens(128)
         .build()

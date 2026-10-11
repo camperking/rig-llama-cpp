@@ -1,8 +1,8 @@
 [package]
 name = "rig-llama-cpp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "Rig completion provider for local GGUF models via llama.cpp, with streaming, tool calling, reasoning, and multimodal (mtmd) support."
 license = "MIT"
 repository = "https://github.com/camperking/rig-llama-cpp"
@@ -37,31 +37,36 @@ rocm = ["llama-cpp-2/rocm"]
 mtmd = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
-rig-core = "0.40.0"
-llama-cpp-2 = { version = "0.1.152", default-features = false, features = ["common", "llguidance"] }
-llama-cpp-sys-2 = { version = "0.1.152", default-features = false }
+rig-core = "0.44.0"
+llama-cpp-2 = { version = "0.1.159", default-features = false, features = ["common", "llguidance"] }
+llama-cpp-sys-2 = { version = "0.1.159", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
-thiserror = "2.0.18"
-chrono = "0.4.44"
+thiserror = "2.0.21"
+chrono = "0.4.45"
 tokio-stream = "0.1"
 log = "0.4"
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 # `json` adds the `tojson` filter, which is not optional in practice: chat
 # templates use it to render both the `tools` array and each tool call's
 # `arguments`, so without it every tool-calling template fails to render.
-minijinja = { version = "2.21.0", features = ["json"] }
+# `serde` provides `Value::from_serialize`, which hands templates the
+# OpenAI-shaped message and tool JSON.
+minijinja = { version = "3.0.0", features = ["json", "serde"] }
 # Must track the version `llama-cpp-2` itself depends on: the `Matcher` we build
 # here is handed to `LlamaSampler::from`, so both crates have to resolve to the
 # same `llguidance` (and transitively the same `toktrie`).
-llguidance = "1.7.5"
+llguidance = "1.9.1"
 
 [dev-dependencies]
+# Rig's agent runtime (builders, prompting, tool loops) lives outside
+# rig-core since 0.43; examples and e2e tests drive models through it.
+rig-agent = "0.44.0"
 schemars = "1"
 anyhow = "1"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+hf-hub = { version = "1.0", features = ["blocking"] }
 # Forces e2e tests to run sequentially. Cargo's default test runner is
 # parallel, but loading multiple GGUF models at once OOMs the GPU and
 # concurrent first-time hf-hub downloads of the same file race the

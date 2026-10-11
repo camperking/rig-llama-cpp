@@ -1,10 +1,17 @@
 use std::num::NonZeroU32;
 use std::thread;
 
-use rig_core::embeddings::{Embedding, EmbeddingError, EmbeddingModel as _};
+use rig_core::driver::{Exchange, Local, Opened, Opening, Step, Transport};
+use rig_core::embeddings::{Embedding, EmbeddingResponse};
+use rig_core::error::ProviderError;
+use rig_core::operation::Embedding as EmbeddingOp;
+use rig_core::wire::Capabilities;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::LoadError;
+
+/// The most texts one embedding request takes.
+const MAX_DOCUMENTS: usize = 256;
 
 enum EmbeddingCommand {
     Request(EmbeddingRequest),
@@ -19,12 +26,10 @@ struct EmbeddingRequest {
 /// The llama.cpp embedding client.
 ///
 /// `EmbeddingClient` loads a GGUF embedding model on a dedicated worker thread
-/// and exposes it through Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
-/// Create one with [`EmbeddingClient::from_gguf`].
+/// and exposes it as a Rig embedding [`Model`](rig_core::Model) (see
+/// [`EmbeddingModelHandle`]). Create one with [`EmbeddingClient::from_gguf`].
 ///
 /// ```rust,no_run
-/// use rig_core::embeddings::EmbeddingModel;
-///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let client = rig_llama_cpp::EmbeddingClient::from_gguf(
@@ -83,7 +88,7 @@ impl EmbeddingClient {
 
     /// Create an embedding model handle from this client.
     pub fn embedding_model(&self, model: impl Into<String>) -> EmbeddingModelHandle {
-        EmbeddingModelHandle::make(self, model, None)
+        self.embedding_model_with_ndims(model, self.ndims)
     }
 
     /// Create an embedding model handle with explicit dimensions.
@@ -92,7 +97,15 @@ impl EmbeddingClient {
         model: impl Into<String>,
         ndims: usize,
     ) -> EmbeddingModelHandle {
-        EmbeddingModelHandle::make(self, model, Some(ndims))
+        let wire = Local::new(crate::PROVIDER)
+            .with_id(model)
+            .with_capabilities(Capabilities::embedding(MAX_DOCUMENTS, ndims));
+        rig_core::Model::new(
+            wire,
+            EmbeddingRuntime {
+                request_tx: self.request_tx.clone(),
+            },
+        )
     }
 }
 
@@ -106,61 +119,51 @@ impl Drop for EmbeddingClient {
     }
 }
 
-/// A handle to a loaded embedding model that implements Rig's [`rig_core::embeddings::EmbeddingModel`] trait.
+/// A loaded embedding model: Rig's local embedding wire over the embedding
+/// worker.
 ///
-/// Obtained via [`EmbeddingClient::embedding_model`].
+/// Obtained via [`EmbeddingClient::embedding_model`]. Call it directly
+/// (`model.embed_text(..)`, `model.call(texts)`), or erase it with
+/// `.erase()` / `.into()` wherever Rig takes a `DynModel<Embedding>`, such as
+/// `EmbeddingsBuilder`.
+pub type EmbeddingModelHandle = rig_core::Model<Local<EmbeddingOp>, EmbeddingRuntime>;
+
+/// The transport behind [`EmbeddingModelHandle`]: it hands each batch of
+/// texts to the embedding worker thread.
 #[derive(Clone)]
-pub struct EmbeddingModelHandle {
+pub struct EmbeddingRuntime {
     request_tx: mpsc::UnboundedSender<EmbeddingCommand>,
-    ndims: usize,
-    #[allow(dead_code)]
-    model_id: String,
 }
 
-impl rig_core::embeddings::EmbeddingModel for EmbeddingModelHandle {
-    const MAX_DOCUMENTS: usize = 256;
-    type Client = EmbeddingClient;
+impl Transport<Local<EmbeddingOp>> for EmbeddingRuntime {
+    fn send(&self, texts: Vec<String>, _exchange: Exchange) -> Opening<Step<EmbeddingOp>> {
+        let request_tx = self.request_tx.clone();
+        Opening::new(async move {
+            let (tx, rx) = oneshot::channel();
+            request_tx
+                .send(EmbeddingCommand::Request(EmbeddingRequest {
+                    texts,
+                    response_tx: tx,
+                }))
+                .map_err(|_| ProviderError::Provider("Embedding worker shut down".into()))?;
 
-    fn make(client: &EmbeddingClient, model: impl Into<String>, dims: Option<usize>) -> Self {
-        Self {
-            request_tx: client.request_tx.clone(),
-            ndims: dims.unwrap_or(client.ndims),
-            model_id: model.into(),
-        }
-    }
+            let vectors = rx
+                .await
+                .map_err(|_| ProviderError::Provider("Response channel closed".into()))?
+                .map_err(ProviderError::Provider)?;
 
-    fn ndims(&self) -> usize {
-        self.ndims
-    }
-
-    async fn embed_texts(
-        &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
-        let texts: Vec<String> = texts.into_iter().collect();
-        let documents = texts.clone();
-
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(EmbeddingCommand::Request(EmbeddingRequest {
-                texts,
-                response_tx: tx,
-            }))
-            .map_err(|_| EmbeddingError::ProviderError("Embedding worker shut down".into()))?;
-
-        let raw_embeddings = rx
-            .await
-            .map_err(|_| EmbeddingError::ProviderError("Response channel closed".into()))?
-            .map_err(EmbeddingError::ProviderError)?;
-
-        Ok(documents
-            .into_iter()
-            .zip(raw_embeddings)
-            .map(|(doc, vec)| Embedding {
-                document: doc,
-                vec: vec.into_iter().map(|v| v as f64).collect(),
-            })
-            .collect())
+            // Rig's embedding fold pairs each vector with its input text.
+            let response = EmbeddingResponse::new(
+                vectors
+                    .into_iter()
+                    .map(|vec| Embedding {
+                        document: String::new(),
+                        vec: vec.into_iter().map(f64::from).collect(),
+                    })
+                    .collect(),
+            );
+            Ok(Opened::new(tokio_stream::iter([Ok(Step::End(response))])))
+        })
     }
 }
 
@@ -241,8 +244,6 @@ fn run_embedding(
 ) -> Result<Vec<Vec<f32>>, String> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
-
     // Encoder-only embedding models require `n_ubatch >= n_tokens` for
     // every single sequence in the batch (llama.cpp asserts on this).
     // The default `n_ubatch` is 512, which is smaller than a typical
@@ -270,9 +271,7 @@ fn run_embedding(
     // the cost of some throughput.
     let mut results = Vec::with_capacity(texts.len());
     for text in texts {
-        let tokens = model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| format!("Tokenization failed: {e}"))?;
+        let tokens = model.vocab().tokenize(text.as_bytes(), true, true);
 
         // Tokenise in chunks that fit `batch_limit` (very long inputs).
         for chunk in tokens.chunks(batch_limit) {

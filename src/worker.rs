@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rig_core::completion::CompletionError;
-use rig_core::streaming::RawStreamingChoice;
+use rig_core::error::ProviderError;
 use tokio::sync::mpsc;
 
 use crate::checkpoint::{
@@ -16,8 +15,8 @@ use crate::prompt::build_prompt;
 use crate::sampling::sample_tokens;
 use crate::slot::{SlotEntry, get_common_prefix};
 use crate::types::{
-    CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceResult, KvCacheParams,
-    ResponseChannel, StreamChunk, StreamSender,
+    CheckpointParams, FitParams, Frame, InferenceCommand, InferenceParams, InferenceResult,
+    KvCacheParams, ResponseChannel, StreamSender,
 };
 
 /// Error returned by inference paths when [`Client::drop`] (or a future
@@ -50,7 +49,7 @@ pub(crate) struct RunCtx<'a, 'm> {
     pub(crate) kv_cache: &'a KvCacheParams,
     pub(crate) checkpoint_params: CheckpointParams,
     #[cfg(feature = "mtmd")]
-    pub(crate) mtmd_ctx: Option<&'a llama_cpp_2::mtmd::MtmdContext>,
+    pub(crate) mtmd_ctx: Option<&'a std::cell::RefCell<llama_cpp_2::mtmd::MtmdContext>>,
     /// Shared shutdown signal. Polled at chunk boundaries during prompt
     /// prefill and per-token in the sampler loop so [`Client::drop`] returns
     /// promptly even when a long generation is in flight.
@@ -124,17 +123,10 @@ fn handle_until_reload<'m>(
                             run_inference(&ctx, &mut persistent, &params, Some(&stream_tx));
                         match result {
                             Ok(result) => {
-                                let _ = stream_tx.send(Ok(RawStreamingChoice::FinalResponse(
-                                    StreamChunk {
-                                        text: result.text,
-                                        prompt_tokens: Some(result.prompt_tokens),
-                                        completion_tokens: Some(result.completion_tokens),
-                                        cached_input_tokens: Some(result.cached_input_tokens),
-                                    },
-                                )));
+                                let _ = stream_tx.send(Ok(Frame::end(result.done)));
                             }
                             Err(e) => {
-                                let _ = stream_tx.send(Err(CompletionError::ProviderError(e)));
+                                let _ = stream_tx.send(Err(ProviderError::Provider(e)));
                             }
                         }
                     }
@@ -255,15 +247,12 @@ fn run_text_inference<'m>(
     req: &InferenceParams,
     stream_tx: Option<&StreamSender>,
 ) -> Result<InferenceResult, String> {
-    use llama_cpp_2::model::AddBos;
-
     let prompt_build = build_prompt(ctx.model, &req.prepared_request)?;
     let prompt = prompt_build.prompt.as_str();
 
-    let new_tokens = ctx
-        .model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| format!("Tokenization failed: {e}"))?;
+    // `add_special` prepends BOS when the model wants one; `parse_special`
+    // turns the template's role markers into their control tokens.
+    let new_tokens = ctx.model.vocab().tokenize(prompt.as_bytes(), true, true);
     let prompt_len = new_tokens.len();
 
     if prompt_len == 0 {

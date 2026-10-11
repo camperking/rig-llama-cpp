@@ -1,36 +1,33 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rig_core::message::{AssistantContent, ToolCall, ToolFunction};
-use rig_core::one_or_many::OneOrMany;
-use rig_core::streaming::{RawStreamingChoice, RawStreamingToolCall};
-
 use crate::parsing::{
     ToolSchemas, extract_structured_json, parse_completion_output, parse_tool_calls,
 };
 use crate::slot::SlotEntry;
-use crate::types::{InferenceParams, InferenceResult, PromptBuildResult, StreamSender};
+use crate::types::{
+    Done, Frame, InferenceParams, InferenceResult, OutputPart, PromptBuildResult, StreamSender,
+};
 use crate::worker::CANCEL_ERR;
 
-/// Convert a `token_to_piece` outcome into a piece-or-empty result.
+/// Detokenize one sampled token, carrying partial UTF-8 sequences over to
+/// the next token through `decoder`.
 ///
-/// `llama.cpp`'s `llama_token_to_piece` returns size 0 when the token has
-/// no printable representation — typically a control / unused / unknown-
-/// attribute token (e.g. `<|im_start|>`, `<|fim_pad|>`). The `llama-cpp-2`
-/// wrapper surfaces that as `TokenToStringError::UnknownTokenType`.
-///
-/// Canonical `llama.cpp` treats empty pieces as "no text to emit, keep
-/// generating" — the sampled token is still consistent with the KV cache
-/// because the caller appends it to the batch on the next iteration.
-/// Real errors (`InsufficientBufferSpace`, `FromUtf8Error`, …) still
-/// propagate so genuine bugs aren't silently swallowed.
-pub(crate) fn token_piece_or_empty(
-    result: Result<String, llama_cpp_2::TokenToStringError>,
-) -> Result<String, String> {
-    match result {
-        Ok(piece) => Ok(piece),
-        Err(llama_cpp_2::TokenToStringError::UnknownTokenType) => Ok(String::new()),
-        Err(other) => Err(format!("Token to piece failed: {other}")),
-    }
+/// A token with no printable representation — typically a control / unused
+/// token (e.g. `<|im_start|>`, `<|fim_pad|>`) — detokenizes to zero bytes, so
+/// it yields an empty piece. Canonical `llama.cpp` treats that as "no text to
+/// emit, keep generating": the sampled token is still consistent with the KV
+/// cache because the caller appends it to the batch on the next iteration.
+fn token_piece(
+    vocab: &llama_cpp_2::vocab::LlamaVocab<'_>,
+    token: llama_cpp_2::token::LlamaToken,
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &mut Vec<u8>,
+) -> String {
+    bytes.clear();
+    vocab.token_to_piece_into(token, bytes, false, None);
+    let mut piece = String::with_capacity(decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(0));
+    let (_, _, _) = decoder.decode_to_string(bytes, &mut piece, false);
+    piece
 }
 
 /// Sample one token.
@@ -148,16 +145,27 @@ fn build_schema_sampler(
 fn build_sampler_chain(
     env: &ModelEnv<'_>,
     req: &InferenceParams,
+    n_ctx: u32,
 ) -> (llama_cpp_2::sampling::LlamaSampler, bool) {
     use llama_cpp_2::sampling::LlamaSampler;
+
+    // The penalty window spans the whole context. llama.cpp no longer reads
+    // a negative `penalty_last_n` as "context size", so it is spelled out.
+    let penalty_last_n = i32::try_from(n_ctx).unwrap_or(i32::MAX);
 
     let base_samplers = vec![
         LlamaSampler::top_k(req.top_k),
         LlamaSampler::top_p(req.top_p, 1),
         LlamaSampler::min_p(req.min_p, 1),
         LlamaSampler::temp(req.temperature),
-        LlamaSampler::penalties(-1, req.repetition_penalty, 0.0, req.presence_penalty),
-        LlamaSampler::dist(42),
+        LlamaSampler::penalties(
+            env.model().n_vocab(),
+            penalty_last_n,
+            req.repetition_penalty,
+            0.0,
+            req.presence_penalty,
+        ),
+        LlamaSampler::dist(req.seed),
     ];
 
     let schema_sampler = req
@@ -190,7 +198,7 @@ pub(crate) fn sample_tokens_from_pos(
     last_entries: &mut Vec<SlotEntry>,
     cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
-    let (output, choice, completion_tokens) = sample_loop(
+    let (output, parts, completion_tokens) = sample_loop(
         env,
         ctx,
         batch,
@@ -201,11 +209,13 @@ pub(crate) fn sample_tokens_from_pos(
         cancel,
     )?;
     Ok(InferenceResult {
-        text: output,
-        choice,
-        prompt_tokens,
-        completion_tokens,
-        cached_input_tokens,
+        parts,
+        done: Done {
+            text: output,
+            prompt_tokens,
+            completion_tokens,
+            cached_input_tokens,
+        },
     })
 }
 
@@ -224,7 +234,7 @@ pub(crate) fn sample_tokens(
 ) -> Result<InferenceResult, String> {
     // Text path: generation resumes right after the prompt tokens.
     let n_past = prompt_tokens as i32;
-    let (output, choice, completion_tokens) = sample_loop(
+    let (output, parts, completion_tokens) = sample_loop(
         env,
         ctx,
         batch,
@@ -235,11 +245,13 @@ pub(crate) fn sample_tokens(
         cancel,
     )?;
     Ok(InferenceResult {
-        text: output,
-        choice,
-        prompt_tokens,
-        completion_tokens,
-        cached_input_tokens,
+        parts,
+        done: Done {
+            text: output,
+            prompt_tokens,
+            completion_tokens,
+            cached_input_tokens,
+        },
     })
 }
 
@@ -247,7 +259,8 @@ pub(crate) fn sample_tokens(
 /// at `n_past` (the position after image chunks); the text path enters at
 /// `prompt_tokens`.
 ///
-/// Returns `(output_text, AssistantContent choice, completion_token_count)`.
+/// Returns `(output_text, parts, completion_token_count)`. `parts` is empty
+/// for a streamed turn: its blocks already went out as frames.
 #[allow(clippy::too_many_arguments)]
 fn sample_loop(
     env: &ModelEnv<'_>,
@@ -258,8 +271,8 @@ fn sample_loop(
     n_past: i32,
     last_entries: &mut Vec<SlotEntry>,
     cancel: &AtomicBool,
-) -> Result<(String, OneOrMany<AssistantContent>, u64), String> {
-    let (mut sampler, has_schema) = build_sampler_chain(env, req);
+) -> Result<(String, Vec<OutputPart>, u64), String> {
+    let (mut sampler, has_schema) = build_sampler_chain(env, req, ctx.n_ctx());
 
     let has_tools = req.prepared_request.tools_json.is_some();
     let has_schema_request = req.prepared_request.json_schema.is_some();
@@ -276,8 +289,10 @@ fn sample_loop(
     // carry markdown fences or role tokens.
     let buffer_output = has_tools || has_schema_request;
 
+    let vocab = env.model().vocab();
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut piece_bytes = Vec::new();
     let mut completion_tokens = 0u64;
 
     for n_cur in (n_past..).take(req.max_tokens as usize) {
@@ -299,12 +314,11 @@ fn sample_loop(
         };
         let token = sample_one(ctx, &mut sampler, sample_idx, has_schema);
 
-        if env.model().is_eog_token(token) {
+        if vocab.is_eog(token) {
             break;
         }
 
-        let piece =
-            token_piece_or_empty(env.model().token_to_piece(token, &mut decoder, false, None))?;
+        let piece = token_piece(&vocab, token, &mut decoder, &mut piece_bytes);
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -313,7 +327,7 @@ fn sample_loop(
         if let Some(tx) = stream_tx
             && !buffer_output
         {
-            let _ = tx.send(Ok(RawStreamingChoice::Message(piece)));
+            let _ = tx.send(Ok(Frame::part(OutputPart::Text(piece))));
         }
 
         batch.clear();
@@ -331,19 +345,15 @@ fn sample_loop(
     // hand to read its values back — see `parsing::ToolSchemas`.
     let schemas = ToolSchemas::parse(req.prepared_request.tools_json.as_deref());
 
-    if let Some(tx) = stream_tx {
-        flush_stream(tx, &output, has_tools, has_schema_request, schemas.as_ref());
-    }
+    let parts = match stream_tx {
+        Some(tx) => {
+            flush_stream(tx, &output, has_tools, has_schema_request, schemas.as_ref());
+            Vec::new()
+        }
+        None => parse_completion_output(&output, has_schema_request, schemas.as_ref()),
+    };
 
-    let choice = build_choice(
-        &output,
-        stream_tx.is_some(),
-        has_tools,
-        has_schema_request,
-        schemas.as_ref(),
-    )?;
-
-    Ok((output, choice, completion_tokens))
+    Ok((output, parts, completion_tokens))
 }
 
 /// Emit the tail of a stream after generation completes.
@@ -354,7 +364,7 @@ fn sample_loop(
 ///   object can be extracted we fall back to the raw output rather than
 ///   finishing the stream with no text at all.
 /// - **tools**: parse the buffered output for tool calls and emit complete
-///   `ToolCall` events. Any leading prose before the first `<tool_call>` is
+///   tool-call parts. Any leading prose before the first `<tool_call>` is
 ///   also surfaced as a message chunk.
 /// - **plain text**: nothing to flush (text was streamed incrementally).
 fn flush_stream(
@@ -367,7 +377,7 @@ fn flush_stream(
     if has_schema {
         let text = extract_structured_json(output).unwrap_or_else(|| output.to_string());
         if !text.is_empty() {
-            let _ = tx.send(Ok(RawStreamingChoice::Message(text)));
+            let _ = tx.send(Ok(Frame::part(OutputPart::Text(text))));
         }
         return;
     }
@@ -382,77 +392,16 @@ fn flush_stream(
                 .min()
                 && !output[..prefix_end].trim().is_empty()
             {
-                let _ = tx.send(Ok(RawStreamingChoice::Message(
+                let _ = tx.send(Ok(Frame::part(OutputPart::Text(
                     output[..prefix_end].trim().to_string(),
-                )));
-            }
-            for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
-                let id = format!("tool-call-{i}");
-                let _ = tx.send(Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
-                    id.clone(),
-                    name,
-                    arguments,
                 ))));
+            }
+            for (name, arguments) in tool_calls {
+                let _ = tx.send(Ok(Frame::part(OutputPart::ToolCall { name, arguments })));
             }
         } else {
             // No tool calls parsed; emit the buffered text as one message.
-            let _ = tx.send(Ok(RawStreamingChoice::Message(output.to_string())));
+            let _ = tx.send(Ok(Frame::part(OutputPart::Text(output.to_string()))));
         }
-    }
-}
-
-/// Build the final `OneOrMany<AssistantContent>` choice from the raw output.
-fn build_choice(
-    output: &str,
-    is_stream: bool,
-    has_tools: bool,
-    has_schema: bool,
-    schemas: Option<&ToolSchemas>,
-) -> Result<OneOrMany<AssistantContent>, String> {
-    if is_stream {
-        if has_schema && let Some(json) = extract_structured_json(output) {
-            return Ok(OneOrMany::one(AssistantContent::text(json)));
-        }
-        if has_tools && let Some(tool_calls) = parse_tool_calls(output, schemas) {
-            let mut content: Vec<AssistantContent> = Vec::new();
-            for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
-                content.push(AssistantContent::ToolCall(ToolCall::new(
-                    format!("tool-call-{i}"),
-                    ToolFunction::new(name, arguments),
-                )));
-            }
-            if let Ok(result) = OneOrMany::many(content) {
-                return Ok(result);
-            }
-        }
-        return Ok(OneOrMany::one(AssistantContent::text(output.to_string())));
-    }
-
-    parse_completion_output(output, has_schema, schemas)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_piece_or_empty_passes_ok_through() {
-        let result = token_piece_or_empty(Ok("hello".to_string()));
-        assert_eq!(result.as_deref(), Ok("hello"));
-    }
-
-    #[test]
-    fn token_piece_or_empty_swallows_unknown_token_type() {
-        let result = token_piece_or_empty(Err(llama_cpp_2::TokenToStringError::UnknownTokenType));
-        assert_eq!(result.as_deref(), Ok(""));
-    }
-
-    #[test]
-    fn token_piece_or_empty_propagates_real_errors() {
-        let result = token_piece_or_empty(Err(
-            llama_cpp_2::TokenToStringError::InsufficientBufferSpace(-32),
-        ));
-        let err = result.expect_err("expected error to propagate");
-        assert!(err.starts_with("Token to piece failed:"), "got: {err}");
     }
 }

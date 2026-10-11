@@ -3,8 +3,11 @@ use crate::types::{FitParams, KvCacheParams};
 
 pub(crate) struct WorkerModel {
     pub(crate) model: llama_cpp_2::model::LlamaModel,
+    /// The multimodal projector. In a `RefCell` because evaluating image
+    /// chunks needs it mutably while the rest of the model is shared; only
+    /// the worker thread ever touches it.
     #[cfg(feature = "mtmd")]
-    pub(crate) mtmd_ctx: Option<llama_cpp_2::mtmd::MtmdContext>,
+    pub(crate) mtmd_ctx: Option<std::cell::RefCell<llama_cpp_2::mtmd::MtmdContext>>,
     pub(crate) n_ctx: u32,
     pub(crate) kv_cache: KvCacheParams,
     /// llguidance's token environment, built on first structured-output
@@ -109,7 +112,7 @@ pub(crate) fn fit_and_load_model(
         let ctx = llama_cpp_2::mtmd::MtmdContext::init_from_file(mmproj, &model, &mtmd_params)
             .map_err(|e| LoadError::MmprojInit(e.to_string()))?;
         log::info!("Multimodal projector loaded from {mmproj}.");
-        Some(ctx)
+        Some(std::cell::RefCell::new(ctx))
     } else {
         None
     };

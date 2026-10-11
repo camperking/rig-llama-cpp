@@ -2,20 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use rig_core::client::CompletionClient;
-use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
-};
-use rig_core::streaming::StreamingCompletionResponse;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc;
 
 use crate::error::LoadError;
-use crate::request::prepare_request;
 use crate::types::{
-    CheckpointParams, FitParams, InferenceCommand, InferenceParams, InferenceRequest,
-    KvCacheParams, RawResponse, ReloadRequest, ResponseChannel, SamplingParams, StreamChunk,
+    CheckpointParams, FitParams, InferenceCommand, KvCacheParams, ReloadRequest, SamplingParams,
 };
+use crate::wire::{CompletionWire, Model, Runtime};
 use crate::worker::{WorkerInit, inference_worker};
 
 /// Default context window used by [`ClientBuilder`] when `n_ctx` is not set.
@@ -139,7 +132,8 @@ impl ClientBuilder {
 /// The llama.cpp completion client.
 ///
 /// `Client` loads a GGUF model on a dedicated inference thread and exposes it
-/// through Rig's [`CompletionClient`] trait. Construct one with
+/// to Rig as a completion [`Model`] (see [`Client::completion_model`]).
+/// Construct one with
 /// [`Client::builder`], or — for backward-compatible positional construction —
 /// [`Client::from_gguf`].
 ///
@@ -299,6 +293,35 @@ impl Client {
         })
     }
 
+    /// A Rig completion model backed by this client's loaded model.
+    ///
+    /// `model` is the id the model reports to Rig (in telemetry and in the
+    /// origin of the turns it produces); it does not select a file. The
+    /// handle snapshots the client's current [`SamplingParams`], so take a
+    /// fresh one after [`Client::reload`] changes them.
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = rig_llama_cpp::Client::builder("path/to/model.gguf").build()?;
+    /// let model = client.completion_model("local");
+    /// let response = model.call("Hello!").await?;
+    /// println!("{:?}", response.choice);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn completion_model(&self, model: impl Into<String>) -> Model {
+        // See the matching `unwrap_or_else` in `reload`: SamplingParams is
+        // `Copy`, so a poisoned lock still holds valid data.
+        let sampling = *self
+            .sampling_params
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        rig_core::Model::new(
+            CompletionWire::new(model),
+            Runtime::new(self.request_tx.clone(), sampling),
+        )
+    }
+
     /// Reload the worker thread with a new model without destroying the backend.
     ///
     /// This swaps the model in-place on the existing inference thread, avoiding the
@@ -393,120 +416,5 @@ impl Drop for Client {
         if let Some(worker_handle) = self.worker_handle.take() {
             let _ = worker_handle.join();
         }
-    }
-}
-
-impl CompletionClient for Client {
-    type CompletionModel = Model;
-}
-
-/// A handle to a loaded model that implements Rig's [`CompletionModel`] trait.
-///
-/// Obtained via [`CompletionClient::agent`] on a [`Client`].
-#[derive(Clone)]
-pub struct Model {
-    request_tx: mpsc::Sender<InferenceCommand>,
-    sampling_params: SamplingParams,
-    #[allow(dead_code)]
-    model_id: String,
-}
-
-impl CompletionModel for Model {
-    type Response = RawResponse;
-    type StreamingResponse = StreamChunk;
-    type Client = Client;
-
-    fn make(client: &Client, model: impl Into<String>) -> Self {
-        // See the matching `unwrap_or_else` in `reload`: SamplingParams is
-        // `Copy`, so a poisoned lock still holds valid data.
-        let sampling_params = *client
-            .sampling_params
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        Self {
-            request_tx: client.request_tx.clone(),
-            sampling_params,
-            model_id: model.into(),
-        }
-    }
-
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        let prepared_request = prepare_request(&request).map_err(CompletionError::ProviderError)?;
-        let max_tokens = request.max_tokens.unwrap_or(512) as u32;
-        let temperature = request.temperature.unwrap_or(0.7) as f32;
-
-        let (response_tx, response_rx) = oneshot::channel();
-
-        self.request_tx
-            .send(InferenceCommand::Request(InferenceRequest {
-                params: InferenceParams {
-                    prepared_request,
-                    max_tokens,
-                    temperature,
-                    top_p: self.sampling_params.top_p,
-                    top_k: self.sampling_params.top_k,
-                    min_p: self.sampling_params.min_p,
-                    presence_penalty: self.sampling_params.presence_penalty,
-                    repetition_penalty: self.sampling_params.repetition_penalty,
-                },
-                response_channel: ResponseChannel::Completion(response_tx),
-            }))
-            .await
-            .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
-
-        let result = response_rx
-            .await
-            .map_err(|_| CompletionError::ProviderError("Response channel closed".into()))?
-            .map_err(CompletionError::ProviderError)?;
-
-        Ok(CompletionResponse {
-            choice: result.choice,
-            usage: Usage {
-                input_tokens: result.prompt_tokens,
-                output_tokens: result.completion_tokens,
-                total_tokens: result.prompt_tokens + result.completion_tokens,
-                cached_input_tokens: result.cached_input_tokens,
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            },
-            raw_response: RawResponse { text: result.text },
-            message_id: None,
-        })
-    }
-
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        let prepared_request = prepare_request(&request).map_err(CompletionError::ProviderError)?;
-        let max_tokens = request.max_tokens.unwrap_or(512) as u32;
-        let temperature = request.temperature.unwrap_or(0.7) as f32;
-
-        let (stream_tx, stream_rx) = mpsc::unbounded_channel();
-
-        self.request_tx
-            .send(InferenceCommand::Request(InferenceRequest {
-                params: InferenceParams {
-                    prepared_request,
-                    max_tokens,
-                    temperature,
-                    top_p: self.sampling_params.top_p,
-                    top_k: self.sampling_params.top_k,
-                    min_p: self.sampling_params.min_p,
-                    presence_penalty: self.sampling_params.presence_penalty,
-                    repetition_penalty: self.sampling_params.repetition_penalty,
-                },
-                response_channel: ResponseChannel::Streaming(stream_tx),
-            }))
-            .await
-            .map_err(|_| CompletionError::ProviderError("Inference thread shut down".into()))?;
-
-        Ok(StreamingCompletionResponse::stream(Box::pin(
-            UnboundedReceiverStream::new(stream_rx),
-        )))
     }
 }

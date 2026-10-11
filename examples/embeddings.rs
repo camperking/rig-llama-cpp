@@ -1,4 +1,3 @@
-use rig_core::embeddings::EmbeddingModel;
 use rig_llama_cpp::EmbeddingClient;
 
 #[tokio::main]
@@ -15,7 +14,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let client = EmbeddingClient::from_gguf(&model_path, n_gpu_layers, 8192)?;
     let model = client.embedding_model("local");
 
-    println!("Embedding dimensions: {}", model.ndims());
+    println!("Embedding dimensions: {}", model.capabilities().ndims);
 
     // Embed a single text
     let embedding = model.embed_text("The sky is blue.").await?;
@@ -31,7 +30,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "Dogs are loyal animals.".to_string(),
         "Machine learning models process data.".to_string(),
     ];
-    let embeddings = model.embed_texts(texts).await?;
+    let embeddings = model.call(texts).await?.embeddings;
 
     for emb in &embeddings {
         println!(

@@ -37,7 +37,7 @@ use serde_json::Value;
 /// verbatim copies of shipped templates, and a method missing from here fails
 /// the whole render, which drops the turn to a lossy fallback path.
 fn unknown_method(
-    _state: &State,
+    _state: &mut State,
     value: &JValue,
     method: &str,
     args: &[JValue],
@@ -158,16 +158,20 @@ pub(crate) fn render_chat_template(
     // Chat templates are whitespace-sensitive: they control spacing with
     // explicit `{%-` / `-%}` markers and rely on everything else surviving
     // verbatim. Keep minijinja from trimming on its own.
-    env.set_keep_trailing_newline(true);
+    env.set_syntax(
+        minijinja::syntax::SyntaxConfig::builder()
+            .keep_trailing_newline(true)
+            .build()?,
+    );
     env.add_template("chat", template)?;
     let tmpl = env.get_template("chat")?;
 
     tmpl.render(minijinja::context! {
-        messages => JValue::from_serialize(messages),
+        messages => JValue::from(minijinja::value::Serde(messages)),
         // When absent, explicitly none rather than undefined: templates branch
         // on `tools` in boolean context, and none is unambiguously falsy.
         tools => match vars.tools {
-            Some(tools) => JValue::from_serialize(tools),
+            Some(tools) => JValue::from(minijinja::value::Serde(tools)),
             None => JValue::from(()),
         },
         // When absent, undefined rather than none — templates test
@@ -274,7 +278,8 @@ mod tests {
         // The `.get()` pycompat shim: present key, missing key, explicit default.
         let tmpl = "{{ messages[0].get('role') }}|{{ messages[0].get('nope') }}|{{ messages[0].get('nope', 'fb') }}";
         let out = render_chat_template(tmpl, &msgs(), &vars(None)).unwrap();
-        assert_eq!(out, "system|none|fb");
+        // minijinja prints none the way Python's Jinja2 does.
+        assert_eq!(out, "system|None|fb");
     }
 
     #[test]

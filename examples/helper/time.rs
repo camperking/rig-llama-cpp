@@ -1,4 +1,4 @@
-use rig_core::tool::Tool;
+use rig_core::tool::PortableTool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -12,7 +12,7 @@ pub struct TimeError(String);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetCurrentTime;
 
-impl Tool for GetCurrentTime {
+impl PortableTool for GetCurrentTime {
     const NAME: &'static str = "get_time";
 
     type Error = TimeError;

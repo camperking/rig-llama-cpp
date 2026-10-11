@@ -1,5 +1,4 @@
-use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_agent::AgentBuilder;
 use rig_llama_cpp::{Client, KvCacheParams, KvCacheType};
 
 #[tokio::main]
@@ -18,8 +17,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .kv_cache(kv_cache)
         .build()?;
 
-    let response = client
-        .agent("local")
+    let response = AgentBuilder::new(client.completion_model("local"))
         .preamble("You are a helpful assistant.")
         .max_tokens(256)
         .build()

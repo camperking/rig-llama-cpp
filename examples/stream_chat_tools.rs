@@ -1,8 +1,8 @@
-use rig_core::agent::MultiTurnStreamItem;
-use rig_core::client::CompletionClient;
+use rig_agent::AgentBuilder;
+use rig_agent::agent::MultiTurnStreamItem;
 use rig_core::message::Message;
-use rig_core::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
-use rig_core::tool::{Tool, ToolDyn};
+use rig_core::streaming::{Item, StreamEvent};
+use rig_core::tool::PortableTool;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,7 +21,7 @@ struct WriteFileError(String);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WriteFile;
 
-impl Tool for WriteFile {
+impl PortableTool for WriteFile {
     const NAME: &'static str = "write_file";
     type Error = WriteFileError;
     type Args = WriteFileArgs;
@@ -65,16 +65,13 @@ async fn main() -> Result<(), anyhow::Error> {
         CheckpointParams::default(),
     )?;
 
-    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(WriteFile)];
-
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble(
             "You are the Chatty agent builder. You help the user author custom agents by \
              writing Markdown files with TOML frontmatter to the current working directory. \
              On confirmation, call write_file with the filename and full contents.",
         )
-        .tools(tools)
+        .tool(WriteFile)
         .max_tokens(4096)
         .default_max_turns(6)
         .temperature(0.3)
@@ -82,11 +79,9 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     let mut stream = agent
-        .stream_chat(
-            "Please write the string FOO to bar.md, then confirm in one sentence.",
-            Vec::<Message>::new(),
-        )
-        .await;
+        .prompt("Please write the string FOO to bar.md, then confirm in one sentence.")
+        .history(Vec::<Message>::new())
+        .stream();
 
     let mut iteration_assistant: Vec<String> = Vec::new();
     let mut tool_call_count = 0u32;
@@ -95,39 +90,37 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("--- streaming start ---");
     while let Some(item) = stream.next().await {
         match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                iteration_assistant.push(format!("TEXT: {}", t.text));
-                print!("{}", t.text);
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-            }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ReasoningDelta { reasoning, .. },
-            )) => {
-                iteration_assistant.push(format!("THINK: {}", reasoning));
-                print!("[think]{}[/think]", reasoning);
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-            }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                tool_call,
+            Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text,
                 ..
-            })) => {
+            }))) => {
+                iteration_assistant.push(format!("TEXT: {text}"));
+                print!("{text}");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }
+            Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning {
+                text,
+                ..
+            }))) => {
+                iteration_assistant.push(format!("THINK: {text}"));
+                print!("[think]{text}[/think]");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }
+            Ok(MultiTurnStreamItem::ToolCall { tool_call }) => {
                 tool_call_count += 1;
                 println!(
                     "\n[TOOL_CALL #{}] name={} id={} args={}",
                     tool_call_count,
                     tool_call.function.name,
                     tool_call.id,
-                    tool_call.function.arguments
+                    serde_json::Value::Object(tool_call.function.arguments)
                 );
             }
-            Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
-                tool_result,
-                ..
-            })) => {
+            Ok(MultiTurnStreamItem::ToolResult { tool_result }) => {
                 tool_result_count += 1;
                 println!(
-                    "[TOOL_RESULT #{}] id={} call_id={:?}",
-                    tool_result_count, tool_result.id, tool_result.call_id
+                    "[TOOL_RESULT #{}] call={} name={}",
+                    tool_result_count, tool_result.call, tool_result.name
                 );
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {

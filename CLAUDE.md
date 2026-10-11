@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`rig-llama-cpp` is a Rust library that integrates local GGUF model inference (via llama.cpp) with the [Rig](https://github.com/0xPlaygrounds/rig) LLM framework. It implements Rig's `CompletionModel` trait so local models can be used interchangeably with cloud-based models.
+`rig-llama-cpp` is a Rust library that integrates local GGUF model inference (via llama.cpp) with the [Rig](https://github.com/0xPlaygrounds/rig) LLM framework. A loaded model is a `rig_core::Model` (a completion wire bound to an in-process transport), so local models can be used interchangeably with cloud-based models. Agents come from the separate `rig-agent` crate (a dev-dependency here, used by examples and e2e tests).
 
 ## Build Commands
 
@@ -66,21 +66,21 @@ Async caller (Tokio)
                     └─> results via oneshot (completion) or mpsc (streaming)
 ```
 
-### Key Types (`src/lib.rs`)
+### Key Types
 
-- **`Client`** — Entry point. Loads a GGUF model and spawns the inference worker thread. Holds the channel sender.
-- **`Model`** — Clone-able handle to the loaded model. Implements Rig's `CompletionModel` + `CompletionClient` traits.
+- **`Client`** (`src/client.rs`) — Entry point. Loads a GGUF model and spawns the inference worker thread. `completion_model(id)` returns a `Model`.
+- **`Model`** (`src/wire.rs`) — Alias for `rig_core::Model<CompletionWire, Runtime>`. `CompletionWire` is Rig's `Wire` + `ReplayTarget` (describes the model, maps generation options, decodes replies); `Runtime` is the `Transport` that sends each request to the worker.
+- **`Frame` / `OutputPart`** (`src/types.rs`) — What the worker sends back: text pieces, whole reasoning blocks, whole tool calls, then an end frame with token counts and the raw text. `FrameDecoder` writes them into Rig's completion turn; `RawDocument` turns the end frame into `CompletionResponse::raw` (a serialized `RawResponse`).
 - **`SamplingParams`** — Token sampling configuration (temperature, top-k, top-p, min-p, repetition/presence penalties).
-- **`StreamDeltaState`** — Accumulates streaming tool call fragments and reasoning deltas across tokens before emitting complete events.
+- **`EmbeddingModelHandle`** (`src/embedding.rs`) — Alias for `rig_core::Model<Local<Embedding>, EmbeddingRuntime>`.
 
 ### Request Flow
 
-1. `Model::completion()` / `Model::stream()` is called
-2. `prepare_request()` formats messages using llama.cpp's chat template (falls back to ChatML)
-3. `InferenceCommand` sent to worker thread
-4. Worker runs `run_inference()`: tokenizes prompt in batches, then samples tokens one at a time
-5. Streaming responses go through `StreamDeltaState` to parse incremental tool calls
-6. Final response parsed by `parse_completion_output()` into Rig's `AssistantContent`
+1. `model.call(request)` / `model.stream(request)`; Rig's `Completion::prepare` validates the request, puts documents into the history, adapts it to what `CompletionWire` accepts and checks the generation options
+2. `Runtime` runs `prepare_request()` (OpenAI-shaped messages + tools JSON) and sends an `InferenceCommand` to the worker thread
+3. Worker runs `run_inference()`: renders the chat template, tokenizes, reuses the KV-cache prefix, then samples tokens one at a time
+4. Streaming turns send each text piece as a frame (tool-call and structured-output turns are buffered and flushed at the end); unary turns are parsed by `parse_completion_output()` into `OutputPart`s
+5. `FrameDecoder` assembles the frames into Rig's `CompletionResponse`
 
 ### Chat Template Handling
 

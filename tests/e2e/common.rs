@@ -12,13 +12,15 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::{Context, ensure};
-use hf_hub::api::sync::Api;
-use rig_core::OneOrMany;
-use rig_core::client::CompletionClient;
-use rig_core::completion::{CompletionModel, GetTokenUsage, ToolDefinition};
-use rig_core::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
-use rig_core::streaming::{StreamedAssistantContent, StreamingChat};
-use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, Model, SamplingParams};
+use hf_hub::HFClientSync;
+use rig_agent::AgentBuilder;
+use rig_agent::agent::MultiTurnStreamItem;
+use rig_core::completion::{CompletionRequest, CompletionResponse, Effort, ToolDefinition};
+use rig_core::message::{AssistantContent, Message, ToolChoice, ToolName, ToolResultContent};
+use rig_core::streaming::{Item, StreamEvent};
+use rig_llama_cpp::{
+    CheckpointParams, Client, FitParams, KvCacheParams, Model, RawResponse, SamplingParams,
+};
 use serde_json::json;
 use tokio_stream::StreamExt;
 
@@ -62,11 +64,17 @@ pub fn test_image_path() -> PathBuf {
 /// Resolve a `ModelSpec` to a local path, downloading via `hf-hub` if not
 /// already cached. The HF API client is initialised once per process.
 pub fn ensure_model(spec: &ModelSpec) -> anyhow::Result<PathBuf> {
-    static API: OnceLock<Api> = OnceLock::new();
-    let api = API.get_or_init(|| Api::new().expect("hf-hub Api init"));
+    static API: OnceLock<HFClientSync> = OnceLock::new();
+    let api = API.get_or_init(|| HFClientSync::new().expect("hf-hub client init"));
+    let (owner, name) = spec
+        .repo
+        .split_once('/')
+        .with_context(|| format!("invalid repo id {}", spec.repo))?;
     let path = api
-        .model(spec.repo.to_string())
-        .get(spec.file)
+        .model(owner, name)
+        .download_file()
+        .filename(spec.file)
+        .send()
         .with_context(|| format!("downloading {}/{}", spec.repo, spec.file))?;
     Ok(path)
 }
@@ -181,16 +189,37 @@ pub fn seed_history() -> Vec<Message> {
     .collect()
 }
 
-pub fn assistant_text(choice: &OneOrMany<AssistantContent>) -> String {
+pub fn assistant_text(choice: &[AssistantContent]) -> String {
     choice
         .iter()
         .filter_map(|content| match content {
             AssistantContent::Text(text) => Some(text.text.clone()),
-            AssistantContent::Reasoning(reasoning) => Some(reasoning.display_text()),
+            AssistantContent::Reasoning(reasoning) => Some(reasoning.text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The generated text exactly as the model produced it: the response's raw
+/// document, a [`RawResponse`].
+pub fn raw_text(response: &CompletionResponse) -> String {
+    serde_json::from_value::<RawResponse>(response.raw.clone())
+        .map(|raw| raw.text)
+        .unwrap_or_default()
+}
+
+/// The `get_time` tool both tool-calling helpers offer.
+fn get_time_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: ToolName::new("get_time").expect("tool name is not empty"),
+        description: "Return the current UTC time as plain text.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+    }
 }
 
 // ── Generic loaders ──────────────────────────────────────────────────
@@ -221,27 +250,29 @@ pub async fn run_completion_turn(
     summary: &mut RunSummary,
 ) -> anyhow::Result<()> {
     let response = model
-        .completion_request(prompt.clone())
-        .preamble(preamble.to_owned())
-        .messages(history.clone())
-        .max_tokens(max_tokens)
-        .temperature(temperature)
-        .send()
+        .call(
+            CompletionRequest::new(prompt.clone())
+                .preamble(preamble)
+                .messages(history.clone())
+                .max_tokens(max_tokens)
+                .temperature(temperature),
+        )
         .await?;
 
+    let output_tokens = response.usage.output_tokens.unwrap_or(0);
     ensure!(
-        !response.raw_response.text.trim().is_empty(),
+        !raw_text(&response).trim().is_empty(),
         "completion turn returned empty text"
     );
     ensure!(
-        response.usage.output_tokens > 0,
+        output_tokens > 0,
         "completion turn returned zero output tokens"
     );
 
     history.push(Message::user(prompt));
     history.push(response.choice.clone().into());
 
-    summary.total_output_tokens += response.usage.output_tokens;
+    summary.total_output_tokens += output_tokens;
     summary.completion_turns += 1;
     summary.conversation_messages = history.len();
 
@@ -257,42 +288,32 @@ pub async fn run_streaming_turn(
     temperature: f64,
     summary: &mut RunSummary,
 ) -> anyhow::Result<()> {
-    let mut stream = model
-        .completion_request(prompt.clone())
-        .preamble(preamble.to_owned())
-        .messages(history.clone())
-        .max_tokens(max_tokens)
-        .temperature(temperature)
-        .stream()
-        .await?;
+    let mut stream = model.stream(
+        CompletionRequest::new(prompt.clone())
+            .preamble(preamble)
+            .messages(history.clone())
+            .max_tokens(max_tokens)
+            .temperature(temperature),
+    )?;
 
     let mut saw_text_chunk = false;
 
     while let Some(item) = stream.next().await {
-        match item? {
-            StreamedAssistantContent::Text(text) => {
-                if !text.text.is_empty() {
-                    saw_text_chunk = true;
-                    summary.streamed_text_chunks += 1;
-                }
-            }
-            StreamedAssistantContent::Reasoning(_) => {}
-            StreamedAssistantContent::ReasoningDelta { .. } => {}
-            StreamedAssistantContent::ToolCall { .. } => {}
-            StreamedAssistantContent::ToolCallDelta { .. } => {}
-            StreamedAssistantContent::Final(_) => {}
-            // Provider-native items rig does not model. The llama.cpp adapter
-            // never emits these, but the arm keeps the match exhaustive.
-            StreamedAssistantContent::Unknown(_) => {}
+        if let Item::Event(StreamEvent::Text { text, .. }) = item?
+            && !text.is_empty()
+        {
+            saw_text_chunk = true;
+            summary.streamed_text_chunks += 1;
         }
     }
 
-    let final_chunk = stream
-        .response
-        .clone()
-        .context("stream did not surface a final response chunk")?;
-    let usage = final_chunk.token_usage();
-    let aggregated_text = assistant_text(&stream.choice);
+    // The stream is drained; finishing folds it into the turn's response.
+    let response = stream
+        .finish()
+        .await
+        .context("stream did not end with a final response")?;
+    let output_tokens = response.usage.output_tokens.unwrap_or(0);
+    let aggregated_text = assistant_text(&response.choice);
 
     ensure!(saw_text_chunk, "streaming turn emitted no text chunks");
     ensure!(
@@ -300,14 +321,14 @@ pub async fn run_streaming_turn(
         "streaming turn aggregated no assistant text"
     );
     ensure!(
-        usage.output_tokens > 0,
+        output_tokens > 0,
         "streaming turn returned zero output tokens"
     );
 
     history.push(Message::user(prompt));
-    history.push(stream.choice.clone().into());
+    history.push(response.choice.clone().into());
 
-    summary.total_output_tokens += usage.output_tokens;
+    summary.total_output_tokens += output_tokens;
     summary.streaming_turns += 1;
     summary.conversation_messages = history.len();
 
@@ -315,26 +336,17 @@ pub async fn run_streaming_turn(
 }
 
 pub async fn attempt_tool_call(model: &Model, summary: &mut RunSummary) -> anyhow::Result<()> {
-    let tool = ToolDefinition {
-        name: "get_time".to_string(),
-        description: "Return the current UTC time as plain text.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-        }),
-    };
-
     let prompt = "What time is it right now? You must call get_time before giving a final answer.";
 
     let response = model
-        .completion_request(prompt)
-        .preamble("You are validating function calling. When a tool is required, emit the tool call first.".to_string())
-        .tool(tool)
-        .tool_choice(ToolChoice::Required)
-        .max_tokens(256)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new(prompt)
+                .preamble("You are validating function calling. When a tool is required, emit the tool call first.")
+                .tool(get_time_tool())
+                .tool_choice(ToolChoice::Required)
+                .max_tokens(256)
+                .temperature(0.0),
+        )
         .await?;
 
     let maybe_tool_call = response.choice.iter().find_map(|content| match content {
@@ -345,41 +357,35 @@ pub async fn attempt_tool_call(model: &Model, summary: &mut RunSummary) -> anyho
     let Some(tool_call) = maybe_tool_call else {
         eprintln!(
             "Tool calling was attempted but the model returned no tool call: {}",
-            response.raw_response.text.trim()
+            raw_text(&response).trim()
         );
         return Ok(());
     };
 
     summary.tool_call_observed = true;
 
-    let tool_result = Message::from(UserContent::tool_result_with_call_id(
-        "tool-result-utc",
-        tool_call
-            .call_id
-            .clone()
-            .unwrap_or_else(|| tool_call.id.clone()),
-        OneOrMany::one(ToolResultContent::text(
-            "Current time: 2026-03-13 00:00:00 UTC",
-        )),
-    ));
+    let tool_result = Message::from(tool_call.result(vec![ToolResultContent::text(
+        "Current time: 2026-03-13 00:00:00 UTC",
+    )]));
 
     let follow_up = model
-        .completion_request("Use the tool result to answer in one short sentence.")
-        .preamble(
-            "Finish the function-calling validation by using the provided tool result.".to_string(),
+        .call(
+            CompletionRequest::new("Use the tool result to answer in one short sentence.")
+                .preamble(
+                    "Finish the function-calling validation by using the provided tool result.",
+                )
+                .messages(vec![
+                    Message::user(prompt),
+                    Message::from(tool_call),
+                    tool_result,
+                ])
+                .max_tokens(96)
+                .temperature(0.0),
         )
-        .messages(vec![
-            Message::user(prompt),
-            Message::from(tool_call),
-            tool_result,
-        ])
-        .max_tokens(96)
-        .temperature(0.0)
-        .send()
         .await?;
 
     ensure!(
-        !follow_up.raw_response.text.trim().is_empty(),
+        !raw_text(&follow_up).trim().is_empty(),
         "tool-call follow-up returned empty text"
     );
 
@@ -390,18 +396,23 @@ pub async fn attempt_tool_call(model: &Model, summary: &mut RunSummary) -> anyho
 
 // ── Per-model focused helpers (thinking + tool roundtrip) ────────────
 
+/// Whether a small model reasons is itself sampled, so `seed` picks a run
+/// known to reason on the bundled llama.cpp; a llama.cpp bump can move it.
 pub async fn completion_with_thinking(
     model: &Model,
     prompt: &str,
     preamble: &str,
+    seed: u64,
 ) -> anyhow::Result<(bool, bool, String)> {
     let response = model
-        .completion_request(prompt)
-        .preamble(preamble.to_string())
-        .max_tokens(2048)
-        .temperature(0.3)
-        .additional_params(json!({ "thinking": true }))
-        .send()
+        .call(
+            CompletionRequest::new(prompt)
+                .preamble(preamble)
+                .max_tokens(2048)
+                .temperature(0.3)
+                .seed(seed)
+                .reasoning(Effort::Medium),
+        )
         .await?;
 
     let has_reasoning = response
@@ -412,29 +423,20 @@ pub async fn completion_with_thinking(
         .choice
         .iter()
         .any(|c| matches!(c, AssistantContent::Text(_)));
-    Ok((has_reasoning, has_text, response.raw_response.text))
+    Ok((has_reasoning, has_text, raw_text(&response)))
 }
 
 pub async fn tool_roundtrip(model: &Model) -> anyhow::Result<(String, String)> {
-    let tool = ToolDefinition {
-        name: "get_time".to_string(),
-        description: "Return the current UTC time as plain text.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-        }),
-    };
-
     let prompt = "What time is it? Call get_time to find out.";
     let response = model
-        .completion_request(prompt)
-        .preamble("You have access to tools. Use them when needed.".to_string())
-        .tool(tool)
-        .max_tokens(256)
-        .temperature(0.0)
-        .additional_params(json!({ "thinking": true }))
-        .send()
+        .call(
+            CompletionRequest::new(prompt)
+                .preamble("You have access to tools. Use them when needed.")
+                .tool(get_time_tool())
+                .max_tokens(256)
+                .temperature(0.0)
+                .reasoning(Effort::Medium),
+        )
         .await?;
 
     let tool_call = response
@@ -446,31 +448,25 @@ pub async fn tool_roundtrip(model: &Model) -> anyhow::Result<(String, String)> {
         })
         .context("model did not produce a tool call")?;
 
-    let tool_name = tool_call.function.name.clone();
+    let tool_name = tool_call.function.name.as_str().to_owned();
 
-    let tool_result = Message::from(UserContent::tool_result_with_call_id(
-        "tool-result-utc",
-        tool_call
-            .call_id
-            .clone()
-            .unwrap_or_else(|| tool_call.id.clone()),
-        OneOrMany::one(ToolResultContent::text(
-            "Current time: 2026-04-12 15:30:00 UTC",
-        )),
-    ));
+    let tool_result = Message::from(tool_call.result(vec![ToolResultContent::text(
+        "Current time: 2026-04-12 15:30:00 UTC",
+    )]));
 
     let follow_up = model
-        .completion_request("Use the tool result to answer briefly.")
-        .preamble("Answer using the tool result provided.".to_string())
-        .messages(vec![
-            Message::user(prompt),
-            Message::from(tool_call),
-            tool_result,
-        ])
-        .max_tokens(128)
-        .temperature(0.0)
-        .additional_params(json!({ "thinking": true }))
-        .send()
+        .call(
+            CompletionRequest::new("Use the tool result to answer briefly.")
+                .preamble("Answer using the tool result provided.")
+                .messages(vec![
+                    Message::user(prompt),
+                    Message::from(tool_call),
+                    tool_result,
+                ])
+                .max_tokens(128)
+                .temperature(0.0)
+                .reasoning(Effort::Medium),
+        )
         .await?;
 
     let text = assistant_text(&follow_up.choice);
@@ -494,7 +490,7 @@ pub struct StreamedStructuredOutcome {
 
 /// Run a structured-output prompt over the **streaming** path, mirroring
 /// the way `chatty` invokes us: schema set on the `AgentBuilder`,
-/// `.stream_chat()` consumed chunk-by-chunk, accumulated text parsed as
+/// the run streamed chunk-by-chunk, accumulated text parsed as
 /// JSON at the end. Returns the accumulated text, the chunk count, and
 /// whether the result deserialized into the requested type.
 ///
@@ -507,25 +503,24 @@ pub async fn run_streamed_structured<T: serde::de::DeserializeOwned>(
     preamble: &str,
     prompt: &str,
 ) -> anyhow::Result<StreamedStructuredOutcome> {
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble(preamble)
         .max_tokens(256)
         .temperature(0.2)
         .output_schema_raw(schema)
         .build();
 
-    use rig_core::agent::MultiTurnStreamItem;
-
-    let mut stream = agent.stream_chat(prompt, Vec::<Message>::new()).await;
+    let mut stream = agent.prompt(prompt).stream();
 
     let mut raw = String::new();
     let mut chunk_count = 0usize;
     while let Some(item) = stream.next().await {
-        if let MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) =
-            item?
+        if let MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+            text,
+            ..
+        })) = item?
         {
-            raw.push_str(&text.text);
+            raw.push_str(&text);
             chunk_count += 1;
         }
     }
@@ -563,13 +558,14 @@ pub async fn run_long_e2e(model_path: &std::path::Path) -> anyhow::Result<()> {
     let model = client.completion_model("local");
 
     let smoke = model
-        .completion_request("Reply with exactly: model ready")
-        .max_tokens(32)
-        .temperature(0.0)
-        .send()
+        .call(
+            CompletionRequest::new("Reply with exactly: model ready")
+                .max_tokens(32)
+                .temperature(0.0),
+        )
         .await?;
     ensure!(
-        !smoke.raw_response.text.trim().is_empty(),
+        !raw_text(&smoke).trim().is_empty(),
         "smoke completion returned empty text"
     );
 
@@ -682,7 +678,7 @@ pub async fn run_vision(
     model_path: &std::path::Path,
     mmproj_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    use rig_core::message::{DocumentSourceKind, Image};
+    use rig_core::message::{DocumentSourceKind, Image, UserContent};
 
     ensure!(
         model_path.is_file(),
@@ -719,34 +715,35 @@ pub async fn run_vision(
     let model = client.completion_model("local");
 
     let response = model
-        .completion_request("Describe this image briefly.")
-        .messages(vec![Message::from(OneOrMany::many(vec![
-            UserContent::Image(Image {
-                media_type: Some(media_type),
-                data: DocumentSourceKind::Raw(image_bytes),
-                detail: None,
-                additional_params: None,
-            }),
-            UserContent::text("What do you see in this image?"),
-        ])?)])
-        .max_tokens(256)
-        .temperature(0.3)
-        .send()
+        .call(
+            CompletionRequest::new("Describe this image briefly.")
+                .messages(vec![Message::from(vec![
+                    UserContent::Image(Image {
+                        media_type: Some(media_type),
+                        data: DocumentSourceKind::Raw(image_bytes),
+                        ..Image::default()
+                    }),
+                    UserContent::text("What do you see in this image?"),
+                ])])
+                .max_tokens(256)
+                .temperature(0.3),
+        )
         .await?;
 
+    let text = raw_text(&response);
+    let output_tokens = response.usage.output_tokens.unwrap_or(0);
     ensure!(
-        !response.raw_response.text.trim().is_empty(),
+        !text.trim().is_empty(),
         "vision completion returned empty text"
     );
     ensure!(
-        response.usage.output_tokens > 0,
+        output_tokens > 0,
         "vision completion returned zero output tokens"
     );
 
     println!(
-        "Vision test passed: output_tokens={}, text_preview={}",
-        response.usage.output_tokens,
-        &response.raw_response.text[..response.raw_response.text.len().min(100)]
+        "Vision test passed: output_tokens={output_tokens}, text_preview={}",
+        text.chars().take(100).collect::<String>()
     );
 
     Ok(())

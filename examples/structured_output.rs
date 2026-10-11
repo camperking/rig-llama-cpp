@@ -1,5 +1,4 @@
-use rig_core::client::CompletionClient;
-use rig_core::completion::TypedPrompt;
+use rig_agent::AgentBuilder;
 use rig_llama_cpp::{CheckpointParams, Client, FitParams, KvCacheParams, SamplingParams};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -26,8 +25,7 @@ async fn main() -> Result<(), anyhow::Error> {
         CheckpointParams::default(),
     )?;
 
-    let agent = client
-        .agent("local")
+    let agent = AgentBuilder::new(client.completion_model("local"))
         .preamble("Extract a single person described in the user's text as structured data.")
         .max_tokens(256)
         .temperature(0.2)
@@ -37,7 +35,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // via llama.cpp grammar, and deserializes the result into `T`.
     let person: Person = agent
         .prompt_typed("Ada is a 36-year-old software engineer living in Berlin.")
-        .await?;
+        .await?
+        .output;
 
     println!("Extracted: {person:#?}");
     Ok(())

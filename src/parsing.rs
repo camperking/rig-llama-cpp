@@ -1,6 +1,6 @@
-use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolFunction};
-use rig_core::one_or_many::OneOrMany;
 use serde_json::Value;
+
+use crate::types::OutputPart;
 
 /// Extract a JSON object from grammar-constrained output that may be wrapped in
 /// markdown code fences, ChatML role tokens, or extra prose.
@@ -109,7 +109,7 @@ pub(crate) fn parse_completion_output(
     raw_text: &str,
     has_json_schema: bool,
     schemas: Option<&ToolSchemas>,
-) -> Result<OneOrMany<AssistantContent>, String> {
+) -> Vec<OutputPart> {
     log::debug!("raw output:\n{raw_text}");
 
     // When the caller set an output schema, grammar-constrained generation produces
@@ -117,24 +117,20 @@ pub(crate) fn parse_completion_output(
     // (e.g. `<|im_start|>assistant\n`) or markdown fences (```json ... ```).
     // Strip those before any other parsing so Rig's typed prompt can deserialize.
     if has_json_schema && let Some(json) = extract_structured_json(raw_text) {
-        return Ok(OneOrMany::one(AssistantContent::text(json)));
+        return vec![OutputPart::Text(json)];
     }
 
     // Try to surface tool calls. The OpenAI-compatible
     // `parse_response_oaicompat` path from llama-cpp-2 0.1.146 was removed in
     // 0.1.147, so we rely on our own parsers here (XML `<tool_call>` blocks,
     // bare / markdown-fenced JSON).
-    if let Some(tool_calls) = parse_tool_calls(raw_text, schemas) {
-        let mut content: Vec<AssistantContent> = Vec::new();
-        for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
-            content.push(AssistantContent::ToolCall(ToolCall::new(
-                format!("tool-call-{i}"),
-                ToolFunction::new(name, arguments),
-            )));
-        }
-        if let Ok(result) = OneOrMany::many(content) {
-            return Ok(result);
-        }
+    if let Some(tool_calls) = parse_tool_calls(raw_text, schemas)
+        && !tool_calls.is_empty()
+    {
+        return tool_calls
+            .into_iter()
+            .map(|(name, arguments)| OutputPart::ToolCall { name, arguments })
+            .collect();
     }
 
     // Try to surface reasoning wrapped in <think>...</think> before giving up
@@ -142,15 +138,13 @@ pub(crate) fn parse_completion_output(
     if let Some((reasoning, text)) = split_thinking(raw_text) {
         let mut content = Vec::new();
         if !reasoning.is_empty() {
-            content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning)));
+            content.push(OutputPart::Reasoning(reasoning));
         }
-        content.push(AssistantContent::text(text));
-        if let Ok(result) = OneOrMany::many(content) {
-            return Ok(result);
-        }
+        content.push(OutputPart::Text(text));
+        return content;
     }
 
-    Ok(OneOrMany::one(AssistantContent::text(raw_text.to_string())))
+    vec![OutputPart::Text(raw_text.to_string())]
 }
 
 /// Unified tool-call parser. Tries, in order:
@@ -780,15 +774,12 @@ mod tests {
     #[test]
     fn parse_completion_output_surfaces_gemma_tool_call() {
         let raw = "<|channel>thought\nreasoning<channel|><|tool_call>call:get_time{}<tool_call|>";
-        let content = parse_completion_output(raw, false, None).unwrap();
-        let call = content.iter().find_map(|c| match c {
-            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+        let content = parse_completion_output(raw, false, None);
+        let name = content.iter().find_map(|c| match c {
+            OutputPart::ToolCall { name, .. } => Some(name.as_str()),
             _ => None,
         });
-        assert_eq!(
-            call.expect("expected a tool call").function.name,
-            "get_time"
-        );
+        assert_eq!(name.expect("expected a tool call"), "get_time");
     }
 
     #[test]
@@ -832,10 +823,10 @@ mod tests {
     #[test]
     fn parse_completion_output_surfaces_gemma_reasoning() {
         let raw = "<|channel>thought\nreason about it\n<channel|>Because of Rayleigh scattering.";
-        let content = parse_completion_output(raw, false, None).unwrap();
+        let content = parse_completion_output(raw, false, None);
         let has_reasoning = content
             .iter()
-            .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+            .any(|c| matches!(c, OutputPart::Reasoning(_)));
         assert!(
             has_reasoning,
             "expected reasoning content, got: {content:?}"
